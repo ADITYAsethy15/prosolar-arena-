@@ -252,3 +252,63 @@ Managed in `src/lib/storage.ts` under the following keys:
 | `ui_settings` | Active provider, theme colors, prose size, history limit (`5..40`), max tokens (`500..100000`), streaming toggle, and Tavily settings. |
 | `chat_history` | Up to 10 most recent chat sessions (with raw binary attachment data stripped). |
 | `active_chat_id` | Currently open session ID. |
+
+---
+
+## Request budget, timeouts, and what Stop cancels (v8)
+
+Everything below was measured against this build, not assumed.
+
+### How many provider requests does one Enter cost?
+
+| action | upstream calls |
+| --- | --- |
+| one chat message (plain cascade, model answers directly) | **1** |
+| same, but the first model in the cascade errors | **2** (one per cascade entry that fails; verified: `force-400 -> stream-8-200`) |
+| one **sandbox agent task** | **1 per tool round, up to 12** (`MAX_TOOL_ROUNDS` in `src/lib/sandbox/tools.ts`) |
+
+So a 20-requests-per-day free allowance is 20 chat messages, but only ~2–5 agent tasks: a task that
+writes 3 files, runs `npm install`, starts a server and fixes an error is 6–9 calls, and the count is
+paid per round whether or not the answer is long. A leg **handoff** is not a request: measured over a
+stream that handed off 4 times, the upstream saw **1** call and the client received 40/40 unique
+chunks with **0** duplicated tokens (the buffer replays by `_seq`, it never re-fetches).
+
+### `max_tokens`
+
+Still honoured everywhere, including through the proxy: `{max_tokens}` is forwarded for chat
+(`server.ts:1305`, groq gets `max_completion_tokens`) and for agent turns the panel value is clamped
+to `256…32000` and only sent when you actually set one (`server.ts:797-801`) — measured live, an
+`8000` budget on a reasoning model returns an empty message with `finish_reason:"length"`, so the
+field is respected by the provider and forwarded verbatim. Leaving the panel field empty sends
+nothing and the provider default applies. That clamp is why 8 is not configurable in the panel.
+
+### Timeouts (all in `server.ts`, verified at the source)
+
+| knob | value | meaning |
+| --- | --- | --- |
+| `INITIAL_TIMEOUT_MS` | 600 000 = **10 min** | budget before the first token, then `TimeoutError` |
+| `ACTIVE_TIMEOUT_MS` | 1 200 000 = **20 min** | budget once tokens are flowing (promoted by `promoteJobTimeout`) |
+| `HANDOFF_LEG_MS` | 250 000, **env-overridable** | end a leg and resume (tuned for Cloud Run's 300 s, not 260 s) |
+| `LEG_HARD_CAP_MS` | 280 000, **env-overridable** | force-close a leg whose browser never resumes |
+| `SANDBOX_TURN_TIMEOUT_MS` | 120 000 | one agent round, deliberately short so a stalled model is an error you can retry |
+| keepalive | `: keepalive` every 15 s | survives proxy idle timeouts without ending the response |
+
+**Do not build a 10 → 20 → 30-minute handoff ladder.** Render's own limit is 100 minutes per HTTP
+response (a lifetime ceiling, not idle), which already exceeds the 20-minute active cap, so extra
+handoffs buy nothing; each one only re-opens a browser `fetch`. `render.yaml` now raises the legs to
+25 min instead, so on Render the ladder simply never fires while staying correct on Cloud Run.
+
+### Stop / abort
+
+`/api/chat/abort` marks the job aborted and calls `controller.abort()` immediately, and the browser
+delivers it with `keepalive: true` so it survives the tab losing focus. Measured on an 18-second
+mock stream aborted at 5 s: upstream socket closed at **5012 ms** with **17 of 60** chunks delivered,
+and still 17 three seconds later — generation stops with the socket, it does not drip to completion.
+The client's resilience loop only ever calls `/api/chat/resume`, never re-`POST`s `/api/chat/stream`,
+so a reconnect cannot double-bill either.
+
+**v8 fix:** agent turns previously had no such path — `Panel.tsx`'s Stop aborted the browser fetch and
+the loop refused further rounds, but the round already in flight kept running server-side to its end.
+`/api/sandbox/turn` now watches `res.on('close')` and aborts the provider request with it. There is no
+queue in front of the provider call anywhere in this server: one user action makes the requests in the
+table and nothing else waits behind it.

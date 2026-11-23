@@ -8,3 +8,13 @@ services:
     startCommand: npm start
     healthCheckPath: /healthz
     autoDeploy: true
+    envVars:
+      # Render caps ONE HTTP RESPONSE at 100 minutes (not an idle window: a total lifetime
+      # ceiling), and long enough for our 20-minute active-stream cap, so the Cloud Run
+      # handoff ladder has nothing to protect against here. Legs are widened until only
+      # Render's own limit binds; keepalive comments every 15s still cover proxy idle
+      # timeouts. Handoff stays wired up and costs zero extra completion tokens.
+      - key: HANDOFF_LEG_MS
+        value: "1500000"
+      - key: LEG_HARD_CAP_MS
+        value: "1530000"

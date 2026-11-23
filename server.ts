@@ -31,6 +31,12 @@ const LEG_HARD_CAP_MS =
   Number(process.env.LEG_HARD_CAP_MS) > 0 ? Number(process.env.LEG_HARD_CAP_MS) : 280_000; // Force-close old leg cleanly before 300s
 const JOB_RETENTION_MS = 60_000; // Retain finished job 60s for late resume replay
 const DISCONNECT_GRACE_MS = 15_000; // 15s grace window for brief network drops
+// The resume buffer exists so a handoff can replay missed bytes; it is otherwise pure RAM.
+// Measured on this build: 3012 buffered events cost 2.4MB (~800B each), so an unbounded buffer
+// would park ~25MB per stream for a 20-minute max-length answer. Env-overridable so the trim
+// path can be exercised with a tiny value instead of trusting it.
+const MAX_REPLAY_EVENTS =
+  Number(process.env.MAX_REPLAY_EVENTS) > 0 ? Number(process.env.MAX_REPLAY_EVENTS) : 12_000;
 const REQUEST_TIMEOUT_MS = INITIAL_TIMEOUT_MS;
 const ACTIVE_STREAM_TIMEOUT_MS = ACTIVE_TIMEOUT_MS;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB per file
@@ -487,6 +493,12 @@ function emitJobEvent(job: StreamJob, payload: Record<string, unknown>): void {
   job.lastSeq = seq;
   const eventPayload = { ...payload, _seq: seq };
   job.events.push({ seq, payload: eventPayload });
+  // Drop only from the front, and only events some writer has already been handed, so a client
+  // that is still connected (or reconnecting) never loses bytes it has not received. Gaps are
+  // safe by construction: the reader dedupes on _seq and keeps appending.
+  if (job.events.length > MAX_REPLAY_EVENTS && job.events[0].seq < job.lastSentSeq) {
+    job.events.splice(0, job.events.length - MAX_REPLAY_EVENTS);
+  }
   if (job.writer && !job.writer.writableEnded && !job.writer.destroyed) {
     job.writer.write(`data: ${JSON.stringify(eventPayload)}\n\n`);
     job.lastSentSeq = seq;
@@ -789,6 +801,16 @@ app.post('/api/sandbox/turn', async (req, res) => {
   const controller = new AbortController();
   const killer = setTimeout(() => controller.abort(), SANDBOX_TURN_TIMEOUT_MS);
 
+  // Stop-button parity with the streaming route. Panel.tsx:676 aborts the browser fetch and
+  // tools.ts:271 refuses to start another round once its signal is set, but until now nothing
+  // told the *in-flight* provider request to stop: the round already sent kept generating to
+  // its end (up to 120s) for an answer nobody would read, billed to the user's key. A torn-down
+  // socket is the only signal the server gets, so forward it upstream.
+  const onClientGone = () => {
+    controller.abort(new Error('Client disconnected mid-turn'));
+  };
+  res.on('close', onClientGone);
+
   try {
     const upstream = await undiciFetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
@@ -881,6 +903,7 @@ app.post('/api/sandbox/turn', async (req, res) => {
     return res.status(502).json({ error: String(err?.message ?? err) });
   } finally {
     clearTimeout(killer);
+    res.off('close', onClientGone);
   }
 });
 
