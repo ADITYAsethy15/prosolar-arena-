@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: solara
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
