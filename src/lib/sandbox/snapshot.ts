@@ -24,6 +24,10 @@ export type SnapshotResult = {
   inlined: string[];
   skipped: SnapshotSkip[];
   bytes: number;
+  /** Stylesheets that arrived through `import './x.css'` and had to be hoisted out of JS. */
+  stylesHoisted: number;
+  /** True when something only a bundler can handle was left behind. */
+  needsBuild: boolean;
 };
 
 /** Per-file and per-document ceilings: a 512 MB tab must survive a fat workspace. */
@@ -119,6 +123,128 @@ function toBase64(bytes: Uint8Array): string {
 
 const decoder = /* @__PURE__ */ new TextDecoder();
 
+const JS_EXT = /\.(?:m?js|cjs)$/;
+const STYLE_EXT = /\.css$/;
+/** Things a bundler hands back as a URL string (or an object) instead of a module. */
+const ASSET_EXT = /\.(?:png|jpe?g|gif|svg|webp|avif|ico|bmp|mp3|mp4|webm|wav|ogg|woff2?|ttf|otf|eot)$/i;
+/** Syntax a browser cannot parse: only a build step can turn these into what they mean. */
+const NEEDS_BUILD = /\.(?:ts|tsx|jsx|vue|svelte|scss|sass|less|styl)$/;
+
+function extOf(path: string): string {
+  const clean = path.split('?')[0];
+  const dot = clean.lastIndexOf('.');
+  return dot < 0 ? '' : clean.slice(dot);
+}
+
+/** `@scope/pkg/dist/x.js` -> { pkg: '@scope/pkg', sub: 'dist/x.js' }. */
+function pkgNameOf(spec: string): { pkg: string; sub: string } | null {
+  const parts = spec.replace(/^\/+/, '').split('?')[0].split('/');
+  if (parts[0]?.startsWith('@') && parts.length > 1) {
+    return { pkg: `${parts[0]}/${parts[1]}`, sub: parts.slice(2).join('/') };
+  }
+  return parts[0] ? { pkg: parts[0], sub: parts.slice(1).join('/') } : null;
+}
+
+async function readJson(abs: string, read: SnapshotRead): Promise<Record<string, unknown> | null> {
+  try {
+    const bytes = await read(abs);
+    if (!bytes) {
+      return null;
+    }
+    return JSON.parse(decoder.decode(bytes)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A dependency's entry file, the way a bundler finds it: package.json `exports`, then
+ * `module`, then `main`, then index. This is what makes a snapshot of a real project work
+ * at all -- `import * as THREE from 'three'` means nothing to a browser, so a page that
+ * keeps that specifier runs no script and renders as bare text.
+ */
+async function resolveBare(
+  spec: string,
+  workspaceRoot: string,
+  read: SnapshotRead,
+  want: 'js' | 'css' = 'js',
+): Promise<string | null> {
+  const named = pkgNameOf(spec);
+  if (!named || named.pkg.includes('..') || named.pkg === 'node_modules') {
+    return null;
+  }
+  const dir = `${workspaceRoot}/node_modules/${named.pkg}`;
+  const manifest = await readJson(`${dir}/package.json`, read);
+  const picks: string[] = [];
+  const condition = (value: unknown): string | null => {
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (value && typeof value === 'object') {
+      const obj = value as Record<string, unknown>;
+      for (const key of want === 'css' ? ['style', 'default'] : ['import', 'default']) {
+        const hit = obj[key];
+        if (typeof hit === 'string') {
+          return hit;
+        }
+      }
+    }
+    return null;
+  };
+  if (manifest) {
+    const exports = manifest.exports;
+    if (named.sub && exports && typeof exports === 'object') {
+      const hit = condition((exports as Record<string, unknown>)[`./${named.sub}`]);
+      if (hit) {
+        picks.push(hit);
+      }
+    }
+    if (!named.sub && exports) {
+      if (typeof exports === 'string') {
+        picks.push(exports);
+      } else if (typeof exports === 'object') {
+        const asMap = exports as Record<string, unknown>;
+        const hit = '.' in asMap ? condition(asMap['.']) : condition(asMap);
+        if (hit) {
+          picks.push(hit);
+        }
+      }
+    }
+    if (!named.sub) {
+      for (const field of want === 'css' ? ['style', 'main'] : ['module', 'main', 'browser']) {
+        const value = manifest[field];
+        if (typeof value === 'string') {
+          picks.push(value);
+        }
+      }
+    }
+  }
+  if (named.sub) {
+    picks.push(named.sub);
+  }
+  picks.push(want === 'css' ? 'index.css' : 'index.js');
+  for (const raw of picks) {
+    const pick = String(raw ?? '').replace(/^\.\//, '').replace(/^\//, '');
+    if (!pick || /^https?:/.test(pick)) {
+      continue;
+    }
+    const abs = `${dir}/${pick}`.replace(/\/{2,}/g, '/');
+    const ext = extOf(abs);
+    if (ext && (want === 'css' ? !STYLE_EXT.test(abs) : !JS_EXT.test(abs))) {
+      continue;
+    }
+    if (await read(abs)) {
+      return abs;
+    }
+  }
+  return null;
+}
+
+/** CJS in a browser module throws on load, which looks identical to "the page is blank". */
+function looksCommonJs(text: string): boolean {
+  return (/\brequire\s*\(/.test(text) || /module\.exports/.test(text)) && !/\bexport\b/.test(text);
+}
+
 export async function buildStandaloneHtml(
   entryAbs: string,
   entryHtml: string,
@@ -131,7 +257,12 @@ export async function buildStandaloneHtml(
   // or an imported module means <entryDir>/assets/x.png, NOT a sibling of whichever file
   // happens to contain the reference (a stylesheet under src/ proved this wrong first try).
   const root = entryDir;
+  // `node_modules` is a sibling of the entry only when the entry sits at the workspace root;
+  // a dist/index.html still resolves its deps from the workspace, so look there too.
+  const wsRoots = root === '/workspace' || root === '/' ? ['/workspace'] : ['/workspace', root];
   const dataUrls = new Map<string, string>();
+  const injectedStyles: string[] = [];
+  const styleKeys = new Set<string>();
   const inFlight = new Set<string>();
   let total = entryHtml.length;
 
@@ -140,6 +271,75 @@ export async function buildStandaloneHtml(
       skipped.push({ ref, path, reason });
     }
     return null;
+  };
+
+  /**
+   * Which names an import statement introduces. Needed because a specifier is only the tail of
+   * the statement: rewriting just `from './x.css'` would leave a dangling `import styles`, which
+   * is a syntax error and a blank page. Stubbing needs the whole statement.
+   */
+  const bindingsOf = (head: string): string[] => {
+    const names: string[] = [];
+    const braces = /\{([^}]*)\}/.exec(head);
+    if (braces) {
+      for (const part of braces[1].split(',')) {
+        const trimmed = part.trim();
+        if (!trimmed) {
+          continue;
+        }
+        const aliased = /\bas\s+([A-Za-z_$][\w$]*)\s*$/.exec(trimmed);
+        const bareName = /([A-Za-z_$][\w$]*)\s*$/.exec(trimmed);
+        const name = aliased?.[1] ?? bareName?.[1] ?? '';
+        if (/^[A-Za-z_$][\w$]*$/.test(name) && name !== 'as') {
+          names.push(name);
+        }
+      }
+    }
+    const single = /(?:^|[\s;])import\s+(?:\*\s+as\s+)?([A-Za-z_$][\w$]*)\s*(?:,\s*\{[^}]*\})?\s*(?:\bfrom\b\s*)?$/.exec(head);
+    if (single) {
+      names.push(single[1]);
+    }
+    return [...new Set(names)];
+  };
+
+  const looksBare = (spec: string): boolean =>
+    !/^[./]/.test(spec) && !/^[\w+.-]+:/.test(spec) && !spec.startsWith('#');
+
+  /**
+   * Where a reference actually lives. Bare specifiers go to node_modules (resolved the way a
+   * bundler does, via the package's own exports/module/main fields) and NEVER to a path next
+   * to the importing file — `three` is not `src/three`, and treating it as one is what made a
+   * snapshot of a real project render as nothing but text. Everything else is entry-relative,
+   * with the extensionless guesses a bundler makes (`./util` -> ./util.js, ./util/index.js).
+   */
+  const locate = async (spec: string, fromAbs: string, want: 'js' | 'css'): Promise<string | null> => {
+    const clean = spec.split('?')[0];
+    if (looksBare(clean)) {
+      for (const base of wsRoots) {
+        const hit = await resolveBare(clean, base, read, want);
+        if (hit) {
+          return hit;
+        }
+      }
+      return null;
+    }
+    const local = resolveRef(clean, relDirOf(fromAbs), root);
+    if (!local) {
+      return null;
+    }
+    if (await read(local)) {
+      return local;
+    }
+    const dot = local.lastIndexOf('.');
+    const slash = local.lastIndexOf('/');
+    if (dot < slash) {
+      for (const guess of want === 'css' ? [`${local}.css`, `${local}/index.css`] : [`${local}.js`, `${local}/index.js`, `${local}.mjs`]) {
+        if (await read(guess)) {
+          return guess;
+        }
+      }
+    }
+    return local;
   };
 
   const readText = async (abs: string): Promise<string | null> => {
@@ -199,23 +399,155 @@ export async function buildStandaloneHtml(
     if (source === null) {
       return skipped.some((s) => s.path === abs) ? null : fail(ref, abs, 'not found in /workspace');
     }
+    if (NEEDS_BUILD.test(abs)) {
+      return fail(ref, abs, 'needs a build step (TypeScript/JSX/SCSS) — snapshot dist/, or build first');
+    }
     inFlight.add(abs);
     let out = source;
-    const specPattern = /(\bfrom\s*|\bimport\s*|\bexport\s+\*\s+from\s*)(['"])([^'"\n]+)\2/g;
+    // Matches the whole statement, not just its tail: swapping only `from './x.css'` would leave
+    // a dangling `import styles`, which is a syntax error and a blank page. The leading class is
+    // consumed so a statement at the start of a line is found, and `stmtStart` is located by where
+    // the captured keyword text begins, so neighbouring statements on one line survive.
+    const specPattern = /(?:^|[;}\n])\s*(import\s+(?:[\w$*{},\s]*?from\s+)?|export\s+(?:\*|\{[\w$*,\s]*\})\s+from\s+)(['"])([^'"\n]+)\2/g;
+    const dynamicPattern = /\bimport\s*\(\s*(['"])([^'"\n]+)\1\s*\)/g;
+    type Edit = { start: number; end: number; text: string };
+    const edits: Edit[] = [];
+    const pushSpan = (edit: Edit) => {
+      if (!edits.some((x) => edit.start < x.end && x.start < edit.end)) {
+        edits.push(edit);
+      }
+    };
     const found = [...out.matchAll(specPattern)];
     for (const match of found) {
       const spec = match[3];
+      const quote = match[2];
+      const keyword = match[1];
+      const stmtStart = (match.index ?? 0) + match[0].indexOf(keyword);
+      const litEnd = (match.index ?? 0) + match[0].length;
+      const litStart = litEnd - spec.length - 2;
+      const names = bindingsOf(keyword);
+      const stubFor = (value: string) =>
+        names.length > 0 ? names.map((name) => `const ${name} = ${value};`).join(' ') : '';
       if (isExternal(spec)) {
         continue;
       }
-      const childAbs = resolveRef(spec, relDirOf(abs), root);
+      const want = STYLE_EXT.test(extOf(spec)) ? 'css' : 'js';
+      const childAbs = await locate(spec, abs, want);
+      // Rewriting by substring (`out.split(spec).join(url)`) corrupts neighbours: the specifier
+      // `three` also occurs inside `'three/examples/…'`, so one replacement mangles the next.
+      // Spans collected against the untouched source and applied back to front cannot.
+      // Two passes can touch the same source (an import and a `new URL()` on one line), and
+      // overlapping spans would splice each other into garbage. Refuse the second one.
+      const pushEdit = (edit: Edit) => {
+        if (!edits.some((x) => edit.start < x.end && x.start < edit.end)) {
+          edits.push(edit);
+        }
+      };
+      /** Replace the quoted specifier only (a resolved import keeps its binding list). */
+      const swapSpec = (url: string) => pushEdit({ start: litStart, end: litEnd, text: `${quote}${url}${quote}` });
+      /** Replace the entire statement (a hoisted stylesheet, an asset binding, a refused module). */
+      const replaceWith = (text: string) => pushEdit({ start: stmtStart, end: litEnd, text });
       if (!childAbs) {
+        if (looksBare(spec.split('?')[0])) {
+          replaceWith(stubFor('undefined'));
+          fail(spec, `/node_modules/${pkgNameOf(spec)?.pkg ?? spec}`, `bare import "${spec}" is not in node_modules — run the install, or snapshot dist/`);
+        }
+        continue;
+      }
+      if (NEEDS_BUILD.test(childAbs)) {
+        replaceWith(stubFor('{}'));
+        fail(spec, childAbs, 'needs a build step (TypeScript/JSX/SCSS) — snapshot dist/, or build first');
+        continue;
+      }
+      // A stylesheet imported from JS is a bundler feature. The module graph cannot carry it,
+      // so it is hoisted into a <style> in the document and the import is dropped. Left alone,
+      // the page loads and renders as unstyled text — exactly the "only letters" symptom.
+      if (STYLE_EXT.test(childAbs)) {
+        const css = await readText(childAbs);
+        if (css === null) {
+          continue;
+        }
+        if (!styleKeys.has(childAbs)) {
+          styleKeys.add(childAbs);
+          injectedStyles.push(await rewriteCss(childAbs, css));
+        }
+        replaceWith(stubFor('{}'));
+        if (names.length > 0 && /\.module\.css$/i.test(childAbs)) {
+          fail(spec, childAbs, 'CSS module: class names need the bundler, bound to {}');
+        }
+        if (!inlined.includes(childAbs)) {
+          inlined.push(childAbs);
+        }
+        continue;
+      }
+      if (ASSET_EXT.test(childAbs)) {
+        const url = await dataUrlFor(childAbs, spec);
+        if (!url) {
+          continue;
+        }
+        if (names.length === 1) {
+          replaceWith(`const ${names[0]} = "${url}";`);
+        } else {
+          replaceWith(stubFor(`"${url}"`));
+        }
         continue;
       }
       const childUrl = await moduleUrl(childAbs, spec, depth + 1);
       if (childUrl) {
-        out = out.split(spec).join(childUrl);
+        swapSpec(childUrl);
+      } else if (names.length > 0) {
+        // A dependency we deliberately refuse to inline (CommonJS, too deep, over budget).
+        // Stub the bindings so the rest of the page still runs, and say why below.
+        replaceWith(stubFor('undefined'));
       }
+    }
+    // Vite's asset idiom. Inside a data: module `import.meta.url` is the module's own URL, so
+    // `new URL('./earth.png', import.meta.url)` resolves to nothing and a texture silently
+    // never loads — which in a three.js scene looks like "the page is just letters and a box".
+    for (const match of [...out.matchAll(/new\s+URL\(\s*(['"])([^'"\n]+)\1\s*,\s*import\.meta\.url\s*\)/g)]) {
+      const spec = match[2];
+      const litStart = (match.index ?? 0) + match[0].indexOf(match[1]) ;
+      const litEnd = litStart + spec.length + 2;
+      const abs2 = resolveRef(spec, relDirOf(abs), root);
+      if (!abs2) {
+        continue;
+      }
+      const dataUrl = await dataUrlFor(abs2, spec);
+      if (dataUrl) {
+        pushSpan({ start: match.index ?? 0, end: (match.index ?? 0) + match[0].length, text: JSON.stringify(dataUrl) });
+      }
+      void litStart;
+      void litEnd;
+    }
+    for (const match of [...out.matchAll(dynamicPattern)]) {
+      const spec = match[2];
+      const quote = match[1];
+      if (isExternal(spec)) {
+        continue;
+      }
+      const litEnd = (match.index ?? 0) + match[0].length - 1;
+      const litStart = litEnd - spec.length - 2;
+      const childAbs = await locate(spec, abs, 'js');
+      if (!childAbs) {
+        fail(spec, spec, 'dynamic import is not in the workspace');
+        continue;
+      }
+      const childUrl = await moduleUrl(childAbs, spec, depth + 1);
+      if (childUrl) {
+        edits.push({ start: litStart, end: litEnd, text: `${quote}${childUrl}${quote}` });
+      }
+    }
+    for (const edit of edits.sort((a, b) => b.start - a.start)) {
+      out = `${out.slice(0, edit.start)}${edit.text}${out.slice(edit.end)}`;
+    }
+
+    // Checked after the splices, or every rewritten `new URL(…, import.meta.url)` would also be
+    // reported as unhandled — the text at this point is what the browser will actually run.
+    if (/import\.meta\.url/.test(out)) {
+      fail(abs, abs, 'import.meta.url left in a module: it points at the snapshot itself, build for exact asset paths');
+    }
+    if (looksCommonJs(out)) {
+      return fail(ref, abs, 'CommonJS module — needs a bundler, nothing was inlined');
     }
     inFlight.delete(abs);
     const url = `data:text/javascript;base64,${toBase64(encoderEncode(out))}`;
@@ -234,7 +566,7 @@ export async function buildStandaloneHtml(
       if (isExternal(spec)) {
         continue;
       }
-      const childAbs = resolveRef(spec, relDirOf(abs), root);
+      const childAbs = await locate(spec, abs, 'css');
       const childCss = childAbs ? await readText(childAbs) : null;
       if (childCss) {
         out = out.split(match[0]).join(await rewriteCss(childAbs!, childCss));
@@ -248,7 +580,7 @@ export async function buildStandaloneHtml(
       if (isExternal(spec)) {
         continue;
       }
-      const assetAbs = resolveRef(spec, relDirOf(abs), root);
+      const assetAbs = await locate(spec, abs, 'css');
       if (!assetAbs) {
         continue;
       }
@@ -371,15 +703,36 @@ export async function buildStandaloneHtml(
   for (const el of [...doc.querySelectorAll('link[rel~="icon"][href], link[rel~="apple-touch-icon"][href]')]) {
     await attrToDataUrl(el, 'href');
   }
-  for (const el of [...doc.querySelectorAll('[style*="url("]')]) {
+  // Not `[style*="url("]`: an attribute-substring selector containing a parenthesis is not
+  // matched consistently across engines (jsdom returns zero hits for it, so this path was
+  // silently untestable). Filter on the value instead of in the selector.
+  for (const el of [...doc.querySelectorAll('[style]')]) {
     const style = el.getAttribute('style');
-    if (style) {
+    if (style && style.includes('url(')) {
       el.setAttribute('style', await rewriteCss(entryAbs, style));
     }
   }
 
+  if (injectedStyles.length > 0) {
+    const head = doc.querySelector('head') ?? doc.documentElement;
+    const style = doc.createElement('style');
+    style.setAttribute('data-snapshot', 'hoisted-from-module-graph');
+    style.textContent = injectedStyles.join('\n');
+    head.appendChild(style);
+  }
+
   const html = `<!doctype html>\n${doc.documentElement.outerHTML}`;
-  return { html, entry: entryAbs, inlined, skipped, bytes: html.length };
+  return {
+    html,
+    entry: entryAbs,
+    inlined,
+    skipped,
+    bytes: html.length,
+    stylesHoisted: injectedStyles.length,
+    // The difference between "blank page" and "here is why": anything only a bundler can
+    // handle was left behind on purpose.
+    needsBuild: skipped.some((entry) => /build step|CommonJS|CSS module|bare import/.test(entry.reason)),
+  };
 }
 
 const encoderEncode = (text: string): Uint8Array => new TextEncoder().encode(text);

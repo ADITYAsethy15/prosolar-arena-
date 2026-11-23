@@ -34,6 +34,7 @@ import {
 import {
   clampRounds,
   getRounds,
+  DEFAULT_ROUNDS,
   MAX_ROUNDS,
   MIN_ROUNDS,
   onAgentTask,
@@ -43,6 +44,16 @@ import {
 
 const AUTO_KEY = 'solara_sandbox_autoapprove';
 const TOKENS_KEY = 'solara_sandbox_maxtokens';
+// What one turn may spend on its answer. A `write_file` call carries the whole file as a
+// string inside the assistant message, so a 250-line component needs ~4k tokens before it
+// has written a word: at 2048 the JSON broke mid-call and the turn ended with
+// finish_reason=length and nothing applied. 8192 fits a real file plus a short reasoning
+// trace; the ceiling is where the app's own chat setting tops out (server clamps 500–100000).
+const MIN_TOKENS = 500;
+const MAX_TOKENS = 32000;
+const DEFAULT_TOKENS = 8192;
+const clampTokens = (value: unknown) =>
+  Math.min(MAX_TOKENS, Math.max(MIN_TOKENS, Math.round(Number(value) || DEFAULT_TOKENS)));
 const MAX_ZIP_FILE_BYTES = 600_000;
 const MAX_ZIP_FILES = 400;
 
@@ -82,6 +93,7 @@ export default function SandboxPanel({
   const [snapshot, setSnapshot] = useState<SnapshotResult | null>(null);
   const [snapshotUrl, setSnapshotUrl] = useState('');
   const [snapshotBusy, setSnapshotBusy] = useState(false);
+  const [snapshotPhase, setSnapshotPhase] = useState<'bundle' | 'build'>('bundle');
   const [snapshotNote, setSnapshotNote] = useState('');
   const [bigPreview, setBigPreview] = useState(false);
   const [previewPort, setPreviewPort] = useState('5173');
@@ -95,7 +107,7 @@ export default function SandboxPanel({
   // all of it deliberating and return nothing (measured live: reasoning_tokens 16384,
   // finish_reason=length, no tool call), while 1-2k pushes them to call a tool.
   const [maxTokens, setMaxTokens] = useState<string>(
-    () => localStorage.getItem(TOKENS_KEY) || '2048',
+    () => String(clampTokens(localStorage.getItem(TOKENS_KEY))),
   );
   const termRef = useRef<{ write: (line: string) => void } | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -224,8 +236,7 @@ export default function SandboxPanel({
   );
 
   useEffect(() => {
-    const safe = String(Number(maxTokens) || 2048).slice(0, 6);
-    localStorage.setItem(TOKENS_KEY, safe);
+    localStorage.setItem(TOKENS_KEY, String(clampTokens(maxTokens)));
   }, [maxTokens]);
 
 
@@ -320,11 +331,15 @@ export default function SandboxPanel({
   }, [open, tab, blocked]);
 
   // A snapshot is a blob URL we own, so it must be revoked when replaced, not leaked.
-  const openStandalone = async () => {
+  // `buildFirst` exists because a Vite project's source cannot be snapshotted faithfully:
+  // bare imports and `import './x.css'` are bundler features, and shipping them as-is is
+  // what makes the copy render as unstyled text.
+  const openStandalone = async (buildFirst = false) => {
     setSnapshotBusy(true);
-    setSnapshotNote('');
+    setSnapshotPhase(buildFirst ? 'build' : 'bundle');
+    setSnapshotNote(buildFirst ? 'building in the container first (npm run build)…' : '');
     try {
-      const result = await snapshotWorkspace();
+      const result = await snapshotWorkspace({ buildFirst });
       const url = URL.createObjectURL(new Blob([result.html], { type: 'text/html' }));
       if (snapshotUrl) {
         URL.revokeObjectURL(snapshotUrl);
@@ -332,17 +347,26 @@ export default function SandboxPanel({
       setSnapshot(result);
       setSnapshotUrl(url);
       const opened = window.open(url, '_blank');
+      const dangling = result.skipped.filter((entry) => entry.ref !== 'build');
       const parts = [
         `${result.entry.replace('/workspace/', '')} + ${result.inlined.length} file(s) inlined`,
-        result.skipped.length ? `${result.skipped.length} left as-is` : 'nothing left dangling',
+        result.stylesHoisted > 0 ? `${result.stylesHoisted} stylesheet(s) hoisted out of JS` : '',
+        // `skipped` also carries a pseudo-entry with ref 'build' when a bundler is needed — same
+        // fact as the sentence below, and not a file that was left dangling, so it must not count.
+        dangling.length
+          ? `${dangling.length} left as-is (${dangling[0].reason}${dangling.length > 1 ? `, +${dangling.length - 1} more` : ''})`
+          : 'nothing left dangling',
         `${Math.round(result.bytes / 1024)} KB`,
-      ];
+      ].filter(Boolean);
+      if (result.needsBuild && !buildFirst) {
+        parts.push('this entry needs a bundler — use build then open');
+      }
       if (!opened) {
         parts.push('popup blocked — use save .html');
       }
       setSnapshotNote(parts.join(' · '));
     } catch (err) {
-      setSnapshotNote(String((err as Error)?.message ?? err));
+      setSnapshotNote(String((err as Error)?.message ?? err).slice(0, 400));
     } finally {
       setSnapshotBusy(false);
     }
@@ -411,7 +435,9 @@ export default function SandboxPanel({
         baseUrl,
         apiKey,
         model,
-        maxTokens: Number(maxTokens) || undefined,
+        // Clamp here too: Ctrl+Enter never blurs the field, and a stray 999999 would
+        // otherwise be sent (and silently rewritten) by the server instead of corrected here.
+        maxTokens: clampTokens(maxTokens),
         maxRounds: budget,
         onStats: (next) => {
           stats = next;
@@ -774,11 +800,20 @@ export default function SandboxPanel({
                     <button
                       type="button"
                       disabled={snapshotBusy}
-                      onClick={() => void openStandalone()}
+                      onClick={() => void openStandalone(false)}
                       className="rounded-lg border border-cyan-800/60 bg-cyan-950/40 px-2.5 py-1 text-[11px] text-cyan-200 hover:bg-cyan-900/40 disabled:opacity-40"
-                      title="Copy the workspace into one self-contained .html and open THAT in a new tab. The container URL cannot leave this tab; a snapshot can, and you can save it."
+                      title="Copy the workspace into one self-contained .html and open THAT in a new tab. Resolves imports inside node_modules and hoists CSS that a module imports, so styles and scripts survive. The container URL cannot leave this tab; a snapshot can, and you can save it."
                     >
-                      {snapshotBusy ? 'bundling\u2026' : 'open standalone'}
+                      {snapshotBusy && snapshotPhase === 'bundle' ? 'bundling\u2026' : 'open standalone'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={snapshotBusy}
+                      onClick={() => void openStandalone(true)}
+                      className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-[11px] text-zinc-300 hover:bg-zinc-800 disabled:opacity-40"
+                      title="Run the project's own build in the container (npm run build, or npx vite build) and snapshot dist/. Use this for Vite/React/TSX projects: the source needs a bundler, so a plain snapshot of it shows text with no styling."
+                    >
+                      {snapshotBusy && snapshotPhase === 'build' ? 'building\u2026' : 'build then open'}
                     </button>
                     {snapshot && snapshotUrl && (
                       <a
@@ -871,10 +906,20 @@ export default function SandboxPanel({
                 <label className="flex items-center gap-1 text-[10px] text-zinc-500">
                   max tokens
                   <input
+                    type="number"
+                    min={MIN_TOKENS}
+                    max={MAX_TOKENS}
+                    step={1024}
                     value={maxTokens}
                     onChange={(event) => setMaxTokens(event.target.value.replace(/\D/g, ''))}
-                    className="w-14 rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 font-mono text-[10px] text-zinc-300"
-                    title="Per-turn token budget. Lower this if a reasoning model rambles and returns nothing."
+                    onBlur={() => setMaxTokens(String(clampTokens(maxTokens)))}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        (event.target as HTMLInputElement).blur();
+                      }
+                    }}
+                    className="w-16 rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 font-mono text-[10px] text-zinc-300"
+                    title={`Tokens the model may spend on ONE answer (${MIN_TOKENS}–${MAX_TOKENS.toLocaleString()}). A file write carries the whole file in that answer, so too small cuts the tool call off mid-JSON; some reasoning models spend the entire budget deliberating and return nothing, so lower it if that happens. Shown as "budget:" at the top of every run.`}
                   />
                 </label>
                 <label className="flex items-center gap-1 text-[10px] text-zinc-500">
@@ -892,7 +937,7 @@ export default function SandboxPanel({
                       }
                     }}
                     className="w-10 rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 font-mono text-[10px] text-zinc-300"
-                    title={`How many times the agent may call a tool before it must answer (${MIN_ROUNDS}–${MAX_ROUNDS}). Each call is one request to your provider, so this is the knob that decides how much daily quota one task costs.`}
+                    title={`How many times the agent may call a tool before it must answer (${MIN_ROUNDS}–${MAX_ROUNDS}, default ${DEFAULT_ROUNDS} — enough for install, several writes, a build and two fixes). Each call is one request to your provider, so this is the knob that decides how much daily quota one task costs; stop ends a run at any point.`}
                   />
                 </label>
                 <button

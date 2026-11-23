@@ -11,10 +11,11 @@
 import { runShell } from './runner';
 import { drainPreviewIssues, listDir, readTextFile, writeTextFile } from './container';
 import { relPath, safePath } from './path';
-import { clampRounds } from './mode';
+import { clampRounds, DEFAULT_ROUNDS } from './mode';
 import { ensureWorkspace } from './project';
 
-export const MAX_TOOL_ROUNDS = 12;
+/** Used when the caller did not pass a budget at all — the same default the UI shows. */
+export const MAX_TOOL_ROUNDS = DEFAULT_ROUNDS;
 
 type ToolDef = {
   type: 'function';
@@ -301,6 +302,15 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
   // mode.ts's bounds, because the cost of a task is rounds x requests and free keys
   // meter requests, not usefulness.
   const rounds = clampRounds(opts.maxRounds ?? MAX_TOOL_ROUNDS);
+  // Say what the run is limited by, up front. A turn that dies at round 24 or on a
+  // truncated answer is a configuration problem, and it used to look like a model problem.
+  const tokenCap = Number(opts.maxTokens) > 0 ? Math.round(Number(opts.maxTokens)) : 8192;
+  opts.emit({
+    kind: 'log',
+    text: `budget: ${rounds} tool call(s), up to ${tokenCap.toLocaleString()} tokens per turn${
+      Number(opts.maxTokens) > 0 ? '' : ' (server default)'
+    }`,
+  });
   let roundsUsed = 0;
   let finalText = '';
 
@@ -416,7 +426,7 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
       if (!answer.content.trim()) {
         const why =
           answer.finishReason === 'length'
-            ? `ran out of tokens (finish_reason=length) — raise max tokens`
+            ? `ran out of tokens (finish_reason=length) — raise max tokens above ${tokenCap.toLocaleString()}`
             : `returned no content and no tool calls${answer.finishReason ? ` (finish_reason=${answer.finishReason})` : ''}`;
         opts.emit({ kind: 'error', text: `Model ${why}. The turn was not completed.` });
       }

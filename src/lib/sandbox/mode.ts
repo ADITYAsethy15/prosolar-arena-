@@ -19,14 +19,19 @@ export const ROUNDS_KEY = 'solara_agent_rounds';
  * 1  — the model gets one batch of tool calls and must then answer. Costs a single
  *      request, which is the right setting on a 20/day free key.
  * 12 — what this app shipped with: enough for "scaffold, install, run, fix once".
- * 30 — ceiling. Each round is separately capped at 120s by SANDBOX_TURN_TIMEOUT_MS,
- *      so 30 rounds is already up to an hour of browser time and more than a full
- *      day of a 20/day allowance; beyond that the failure mode is a stalled tab,
- *      not a finished project.
+ * 24 — the default now. A real Vite project is not one edit: install, write 4-6
+ *      files, run the build, read the error, fix it, rebuild. At 12 that sequence ran
+ *      out of budget mid-task and the "answer" was a tool call, which is the second
+ *      worst failure after a blank preview — the model was cut off while working.
+ * 60 — ceiling. Each round is separately capped at 120s by SANDBOX_TURN_TIMEOUT_MS,
+ *      so 60 rounds is up to two hours of browser time and three days of a 20/day
+ *      free key. That is deliberate, not careless: **stop** works now (it kills the
+ *      running command and parks nothing), and every round is visible in the transcript,
+ *      so the cost of a runaway is a button press rather than a stalled tab.
  */
 export const MIN_ROUNDS = 1;
-export const MAX_ROUNDS = 30;
-export const DEFAULT_ROUNDS = 12;
+export const MAX_ROUNDS = 60;
+export const DEFAULT_ROUNDS = 24;
 
 export function clampRounds(value: unknown): number {
   const n = Math.round(Number(value));

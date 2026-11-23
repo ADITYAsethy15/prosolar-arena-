@@ -79,7 +79,70 @@ export async function listTree(root: string = WORKSPACE_ROOT, maxDepth = 3): Pro
  * A production build is preferred over the source entry, because that is the version
  * with no dev-server dependencies left in it.
  */
-export async function snapshotWorkspace(): Promise<SnapshotResult> {
+/**
+ * `import './style.css'` and bare specifiers are bundler features. A Vite project that has
+ * never been built therefore cannot be snapshotted from source no matter how good the
+ * inliner is — so the panel is allowed to build it first, in the container, and snapshot
+ * the result. Deliberately not routed through runner.ts: that module imports getContainer
+ * from here, and the cycle would be resolved at bundle time for no benefit.
+ */
+async function buildCommandFor(pkgJsonText: string | null): Promise<string> {
+  if (!pkgJsonText) {
+    return 'npx vite build';
+  }
+  let pkg: Record<string, unknown>;
+  try {
+    pkg = JSON.parse(pkgJsonText) as Record<string, unknown>;
+  } catch {
+    return 'npx vite build';
+  }
+  const scripts = (pkg.scripts ?? {}) as Record<string, unknown>;
+  if (typeof scripts.build === 'string' && scripts.build.trim()) {
+    return 'npm run build';
+  }
+  const deps = { ...(pkg.dependencies as object | undefined), ...(pkg.devDependencies as object | undefined) };
+  if (deps && typeof deps === 'object' && 'vite' in deps) {
+    return 'npx vite build';
+  }
+  return '';
+}
+
+async function runBuild(container: any, cmd: string): Promise<{ exitCode: number; output: string }> {
+  const proc = await container.spawn('sh', ['-c', cmd], {
+    cwd: '/workspace',
+    env: { FORCE_COLOR: '0', NO_COLOR: '1', npm_config_yes: 'true' },
+  });
+  let output = '';
+  const collector = new WritableStream({
+    write: (chunk: string) => {
+      if (output.length < 40_000) {
+        output += chunk;
+      }
+    },
+  });
+  void proc.output.pipeTo(collector).catch(() => undefined);
+  const BUILD_TIMEOUT_MS = 240_000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const raced = await Promise.race([
+    proc.exit.then((code: number) => ({ code: Number(code), timedOut: false })),
+    new Promise<{ code: number; timedOut: boolean }>((resolve) => {
+      timer = setTimeout(() => resolve({ code: 124, timedOut: true }), BUILD_TIMEOUT_MS);
+    }),
+  ]);
+  if (timer) {
+    clearTimeout(timer);
+  }
+  if (raced.timedOut) {
+    try {
+      proc.kill();
+    } catch {
+      // already gone
+    }
+  }
+  return { exitCode: raced.timedOut ? 124 : raced.code, output: output.trim().slice(-3_000) };
+}
+
+export async function snapshotWorkspace(opts: { buildFirst?: boolean } = {}): Promise<SnapshotResult> {
   const container = await getContainer();
   const read = async (abs: string): Promise<Uint8Array | null> => {
     try {
@@ -88,6 +151,17 @@ export async function snapshotWorkspace(): Promise<SnapshotResult> {
       return null;
     }
   };
+  if (opts.buildFirst) {
+    const pkgBytes = await read(`${WORKSPACE_ROOT}/package.json`);
+    const cmd = await buildCommandFor(pkgBytes ? new TextDecoder().decode(pkgBytes) : null);
+    if (!cmd) {
+      throw new Error('no "build" script in package.json and no vite dependency — nothing to build. Snapshot from source still works for plain JS.');
+    }
+    const built = await runBuild(container, cmd);
+    if (built.exitCode !== 0) {
+      throw new Error(`build failed (${cmd}, exit ${built.exitCode}):\n${built.output || 'no output'}`);
+    }
+  }
   const candidates = [
     `${WORKSPACE_ROOT}/dist/index.html`,
     `${WORKSPACE_ROOT}/build/index.html`,
@@ -109,7 +183,17 @@ export async function snapshotWorkspace(): Promise<SnapshotResult> {
       'nothing to snapshot yet: the workspace has no index.html (or dist/index.html). Ask the agent to build one, or use serve to view it in this tab.',
     );
   }
-  return buildStandaloneHtml(entry, text, read);
+  const result = await buildStandaloneHtml(entry, text, read);
+  if (result.needsBuild && !opts.buildFirst) {
+    // Not a failure — the page will simply be missing whatever needed a bundler. Say so in a
+    // way the panel can turn into a button, instead of shipping a blank-looking copy.
+    result.skipped.push({
+      ref: 'build',
+      path: entry,
+      reason: 'this entry needs a bundler — press "build then open" for a faithful copy',
+    });
+  }
+  return result;
 }
 
 export async function readTextFile(path: string): Promise<string> {

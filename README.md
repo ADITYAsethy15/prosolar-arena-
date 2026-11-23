@@ -58,8 +58,10 @@ a workspace at `/workspace` you can browse, run tests in, and preview.
 - The **Files** tab re-reads `/workspace` on `refresh` and says what it found (`7 entries · 4:12:03`), spins while
   reading, and keeps the previous list if the read fails rather than showing a false "(empty workspace)". A tool
   round also refreshes the list by itself, so files appear while the agent is still working.
-- Commands are capped at 45 s and 100 KB of output; the agent gets 12 tool rounds per message; the path jail
-  keeps every operation inside `/workspace`.
+- Commands are capped at 120 s (5 min for `npm i`/`npm run`, 4 min for a build) and their output tail at 100 KB;
+  the agent gets up to **24** tool rounds per message (the `tool calls` box, 1–60); the path jail
+  keeps every operation inside `/workspace`. Every run prints the two numbers it is limited by —
+  `budget: 24 tool call(s), up to 8,192 tokens per turn` — so a truncated turn is never mistaken for a lazy model.
 - Node.js only — no Python, no apt. `npm i` works through StackBlitz's registry proxy, so it needs a network
   connection, and files are per-session (export/import the workspace as a `.zip` to keep it).
 - The workspace is an ES module (`package.json` has `"type": "module"`), so `require(...)` in a `.js` file fails.
@@ -77,12 +79,23 @@ a workspace at `/workspace` you can browse, run tests in, and preview.
   - **open standalone** makes a copy that *can* leave: `src/lib/sandbox/snapshot.ts` reads `dist/index.html`
     (falling back to `index.html`) out of `/workspace` and rebuilds it as ONE self-contained document, then opens
     it from a `blob:` URL in a new tab. Every `<script src>`, `<link href>`, `@import` and `url()` — including
-    ones inside imported stylesheets and inline `style` attributes — is resolved against the workspace and
-    replaced with a `data:` URL, recursively for module graphs (depth 12), because a relative `./util.js` left
-    alone would resolve against the blob and 404. Dev-server hooks like `/@vite/client` are stripped, `</script>`
-    inside inlined code cannot break out of the tag, and a cycle terminates instead of hanging. Ceilings: 4 MB
-    per file, 24 MB per document; anything over, or missing, is left as-is and *reported* under the button in a
-    `skipped` line rather than silently dropped, so the page still opens.
+    ones inside imported stylesheets and inline `style` attributes — is resolved and replaced with a `data:` URL,
+    recursively for module graphs (depth 12), because a relative `./util.js` left alone would resolve against the
+    blob and 404. Dev-server hooks like `/@vite/client` are stripped, `</script>` inside inlined code cannot break
+    out of the tag, and a cycle terminates instead of hanging. Ceilings: 4 MB per file, 24 MB per document;
+    anything over, or missing, is left as-is and *reported* under the button rather than silently dropped.
+    Three things make it work on a real project rather than a toy page:
+    - **bare imports are resolved through `node_modules`** the way a bundler does — the package's `exports`
+      map, then `module`, then `main`, then `index`. `import * as THREE from 'three'` becomes the ESM build
+      inlined into the page (a `require`-only package is reported instead of half-inlined, and the import is
+      stubbed so the rest of the page still runs).
+    - **`import './style.css'` is hoisted into a `<style>`** in the head. A module graph cannot carry a
+      stylesheet, so before this the copy loaded as unstyled text — the "only letters" preview.
+    - **`new URL('./x.png', import.meta.url)` becomes the data URL** it points at, because inside a `data:`
+      module `import.meta.url` is the module itself, which is how a three.js texture silently fails to load.
+  - **build then open** runs the project's own build in the container (`npm run build`, or `npx vite build`
+    when there is no script) and snapshots `dist/`. Use it for Vite/React/TS/TSX or SCSS entries: those are not
+    valid browser syntax, so a snapshot of the source can only ever be partial — the note says so and points here.
   - **save .html** writes that same document to disk — no popup to block, no iframe sandbox in the way, and it
     keeps working after you close the tab.
   - **raw preview URL** is the old plain link, kept but labelled honestly: it only answers while the tab holding
@@ -102,8 +115,12 @@ LM Studio work while a remote `http` endpoint is refused.
 
 **If an agent turn stops with a blank answer, raise `max tokens`.** Reasoning models bill thinking tokens
 before they write anything, so a budget that looks generous can leave `content` empty with
-`finish_reason=length`. The panel field defaults to 2048; 4000–8000 suits tool-calling reasoning models, and
-the panel shows the tail of the model's reasoning so the failure names itself instead of looking like a hang.
+`finish_reason=length`. The panel field now defaults to **8192** (it was 2048, which is smaller than a single
+`write_file` call: the file's whole text travels inside that one answer, so the JSON broke mid-call and the turn
+ended having applied nothing). It is a clamped number box, 500–32000, and the value you set is the value sent
+upstream — asserted end-to-end in the panel harness. 4000–8000 suits tool-calling reasoning models; some models
+spend the entire budget deliberating and return nothing, which is why the ceiling is not higher and why the
+refusal line names the exact figure: `raise max tokens above 8,192`.
 
 **The agent can see its own running page.** WebContainer boots with `forwardPreviewErrors`, so an uncaught
 exception or rejected promise in the preview is forwarded to the tab and injected into the model's next request
@@ -360,15 +377,18 @@ to *N* times — and **every round is another request on your key**. The budget 
 | --- | --- | --- |
 | **1** | "make this one edit", read-only questions, or any day you are rationing a 20/day free key. The model gets one batch of tool calls and must then answer. | 1 request |
 | **3–4** | small, well-specified changes: edit → run → fix once | 3–4 requests |
-| **12** *(default, = the old fixed ceiling)* | "scaffold a small app": write a few files, install, start it, fix what broke | ≤12 requests |
-| **30** *(maximum)* | big multi-file builds where you intend to walk away and come back | ≤30 requests |
+| **12** *(what v9 shipped with)* | "scaffold a small app": write a few files, install, start it, fix what broke | ≤12 requests |
+| **24** *(default since v11)* | a real Vite project: install, 4–6 files, build, read the error, fix, rebuild — which is exactly the sequence that used to run out of budget mid-task | ≤24 requests |
+| **60** *(maximum)* | big multi-file builds where you intend to walk away and come back | ≤60 requests |
 
 The bounds are deliberate:
 
 - **Floor 1**, not 0 — a task that may not touch the sandbox is just chat, and that mode already exists.
-- **Ceiling 30**, because each round is separately capped at 120 s by `SANDBOX_TURN_TIMEOUT_MS`, so 30
-  rounds is already up to an hour of live tab time; and on a 20-requests-per-day key, one task at 30 is
-  more than a full day of quota. Past that the failure mode is a stalled tab, not a finished project.
+- **Ceiling 60**, because each round is separately capped at 120 s by `SANDBOX_TURN_TIMEOUT_MS`, so 60 rounds
+  is up to two hours of live tab time, and on a 20-requests-per-day key one task at 60 is three days of quota.
+  Raising it anyway is a deliberate trade: **stop** works now (it kills the command mid-run, and a run parked on
+  an approval card releases immediately), and every round is visible in Activity, so the cost of a runaway is a
+  button press instead of a stalled tab. That is the only reason a ceiling this loose is defensible.
 - Anything out of range is clamped in `src/lib/sandbox/mode.ts` (`clampRounds`), so a hand-typed
   `999` or `0` in the box cannot hang a session.
 
@@ -379,8 +399,12 @@ just makes it yours.
 
 ### What was measured (v9, mock upstream + the real server, no tokens spent)
 
-- Budgets **1 / 3 / 12 / 30** produced exactly **1 / 3 / 12 / 30** upstream requests against a mock
-  that *never* stops asking for tools; `999` → 30, `abc`/`0`/empty → 12.
+- Budgets **1 / 3 / 24 / 60** produced exactly **1 / 3 / 24 / 60** upstream requests against a mock
+  that *never* stops asking for tools; `999` → 60, `abc`/`0`/empty → 24 (`MAX_TOOL_ROUNDS` in `tools.ts` is now
+  defined as `DEFAULT_ROUNDS`, so the loop's fallback and the panel's default cannot drift apart).
+- A turn truncated at `finish_reason=length` costs 1 request and prints
+  `Model ran out of tokens (finish_reason=length) — raise max tokens above 2,048. The turn was not completed.`;
+  with no cap passed at all the budget line says `up to 8,192 tokens per turn (server default)`.
 - A model that finishes on its own after one tool call cost **3** requests at budget 12 and reported
   `used 3 of 12 tool calls`.
 - In the mounted app: **chat** mode Enter → exactly one `/api/chat/stream`; **agent** mode Enter →
