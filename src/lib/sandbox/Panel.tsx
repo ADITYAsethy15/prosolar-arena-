@@ -24,6 +24,15 @@ import { relPath } from './path';
 import { ensureWorkspace } from './project';
 import { runShell } from './runner';
 import { resolveApproval, runAgentTurn, setApprovalSink, type AgentEvent } from './tools';
+import {
+  clampRounds,
+  getRounds,
+  MAX_ROUNDS,
+  MIN_ROUNDS,
+  onAgentTask,
+  reportAgentResult,
+  saveRounds,
+} from './mode';
 
 const AUTO_KEY = 'solara_sandbox_autoapprove';
 const TOKENS_KEY = 'solara_sandbox_maxtokens';
@@ -65,6 +74,7 @@ export default function SandboxPanel({
   const [autoApprove, setAutoApprove] = useState<boolean>(
     () => typeof localStorage !== 'undefined' && localStorage.getItem(AUTO_KEY) === '1',
   );
+  const [rounds, setRounds] = useState<string>(() => String(getRounds()));
   const [running, setRunning] = useState(false);
 
   // Some reasoning models are better with a SMALL budget: given 16k they can spend
@@ -255,28 +265,48 @@ export default function SandboxPanel({
     setApproval(null);
   };
 
-  const runTask = async () => {
-    const text = prompt.trim();
-    if (!text || running) {
+  // `textOverride` lets the composer's Agent mode drive a task without the user
+  // retyping it into this panel.
+  const runTask = async (textOverride?: string) => {
+    const text = (textOverride ?? prompt).trim();
+    if (!text) {
       return;
     }
+    if (running) {
+      setStatus('agent is busy — stop the current task first');
+      return;
+    }
+    const budget = clampRounds(rounds);
+    if (String(budget) !== rounds) {
+      setRounds(String(saveRounds(budget)));
+    }
+    let stats = { roundsUsed: 0, roundsAllowed: budget };
     setRunning(true);
     setStatus('agent running…');
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      await runAgentTurn({
+      const answer = await runAgentTurn({
         prompt: text,
         history,
         baseUrl,
         apiKey,
         model,
         maxTokens: Number(maxTokens) || undefined,
+        maxRounds: budget,
+        onStats: (next) => {
+          stats = next;
+        },
         emit: log,
         signal: controller.signal,
       });
       await refreshTree();
       setStatus('');
+      // Hand the result to the chat transcript (App.tsx subscribes) so an agent
+      // reply is readable where the question was asked, with its real cost.
+      if (answer?.trim()) {
+        reportAgentResult({ text: answer.trim(), ...stats });
+      }
     } catch (err) {
       setStatus(String((err as Error)?.message ?? err));
     } finally {
@@ -284,6 +314,17 @@ export default function SandboxPanel({
       abortRef.current = null;
     }
   };
+
+  const runTaskRef = useRef(runTask);
+  runTaskRef.current = runTask;
+
+  useEffect(
+    () =>
+      onAgentTask((text) => {
+        void runTaskRef.current(text);
+      }),
+    [],
+  );
 
   // Adopt any port the agent opened itself, so a backgrounded server shows up without
   // the user having to type a port and press serve.
@@ -659,6 +700,24 @@ export default function SandboxPanel({
                     onChange={(event) => setMaxTokens(event.target.value.replace(/\D/g, ''))}
                     className="w-14 rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 font-mono text-[10px] text-zinc-300"
                     title="Per-turn token budget. Lower this if a reasoning model rambles and returns nothing."
+                  />
+                </label>
+                <label className="flex items-center gap-1 text-[10px] text-zinc-500">
+                  tool calls
+                  <input
+                    type="number"
+                    min={MIN_ROUNDS}
+                    max={MAX_ROUNDS}
+                    value={rounds}
+                    onChange={(event) => setRounds(event.target.value.replace(/\D/g, ''))}
+                    onBlur={() => setRounds(String(saveRounds(rounds)))}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        (event.target as HTMLInputElement).blur();
+                      }
+                    }}
+                    className="w-10 rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 font-mono text-[10px] text-zinc-300"
+                    title={`How many times the agent may call a tool before it must answer (${MIN_ROUNDS}–${MAX_ROUNDS}). Each call is one request to your provider, so this is the knob that decides how much daily quota one task costs.`}
                   />
                 </label>
                 <button

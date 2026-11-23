@@ -312,3 +312,53 @@ the loop refused further rounds, but the round already in flight kept running se
 `/api/sandbox/turn` now watches `res.on('close')` and aborts the provider request with it. There is no
 queue in front of the provider call anywhere in this server: one user action makes the requests in the
 table and nothing else waits behind it.
+
+---
+
+## Chat mode vs Agent mode, and the tool-call budget (v9)
+
+The composer has a two-state toggle. **Chat** is what this app always did: one message, exactly one
+provider request. **Agent** hands the message to the in-browser sandbox loop, which may call tools up
+to *N* times — and **every round is another request on your key**. The budget is now a UI control
+(`tool calls` in the sandbox panel, mirrored as a `≤N` chip on the toggle) instead of a constant in
+`tools.ts`.
+
+### Choosing N
+
+| N | what it is good for | one task costs |
+| --- | --- | --- |
+| **1** | "make this one edit", read-only questions, or any day you are rationing a 20/day free key. The model gets one batch of tool calls and must then answer. | 1 request |
+| **3–4** | small, well-specified changes: edit → run → fix once | 3–4 requests |
+| **12** *(default, = the old fixed ceiling)* | "scaffold a small app": write a few files, install, start it, fix what broke | ≤12 requests |
+| **30** *(maximum)* | big multi-file builds where you intend to walk away and come back | ≤30 requests |
+
+The bounds are deliberate:
+
+- **Floor 1**, not 0 — a task that may not touch the sandbox is just chat, and that mode already exists.
+- **Ceiling 30**, because each round is separately capped at 120 s by `SANDBOX_TURN_TIMEOUT_MS`, so 30
+  rounds is already up to an hour of live tab time; and on a 20-requests-per-day key, one task at 30 is
+  more than a full day of quota. Past that the failure mode is a stalled tab, not a finished project.
+- Anything out of range is clamped in `src/lib/sandbox/mode.ts` (`clampRounds`), so a hand-typed
+  `999` or `0` in the box cannot hang a session.
+
+On prior art: bolt.diy exposes no such cap at all — its project MCP bounds *per-call* output
+(`MAX_LIST_RESULTS = 500`, `MAX_TEXT_BYTES = 256_000`, `MAX_PROCESSES = 50`) and lets the loop run
+until the model stops emitting actions. The fixed 12 this app shipped with was already stricter; N9
+just makes it yours.
+
+### What was measured (v9, mock upstream + the real server, no tokens spent)
+
+- Budgets **1 / 3 / 12 / 30** produced exactly **1 / 3 / 12 / 30** upstream requests against a mock
+  that *never* stops asking for tools; `999` → 30, `abc`/`0`/empty → 12.
+- A model that finishes on its own after one tool call cost **3** requests at budget 12 and reported
+  `used 3 of 12 tool calls`.
+- In the mounted app: **chat** mode Enter → exactly one `/api/chat/stream`; **agent** mode Enter →
+  zero stream calls and one task on the bus, with the user message still landing in the transcript.
+- End-to-end through the proxy: budget 5 + a model that answers after 1 tool call → 2 upstream calls,
+  2 proxy calls (no hidden retries), and the reply arrives back in the chat with
+  `_agent · used 2 of 5 tool calls_`.
+- Budget 1 against the endless model → stopped after 1 call with `Stopping: 1-tool-call limit reached`
+  rendered in Activity.
+
+Agent mode is also the only mode that can spend your quota by accident, so the chip next to the
+toggle always shows what one Enter will cost before you press it.

@@ -84,6 +84,17 @@ import { sanitizeForSpeech, splitIntoSpeechChunks } from './utils/speechSanitize
 import { extractZipForChat } from './lib/zipExtract';
 import SandboxPanel from './lib/sandbox/Panel';
 import { sandboxUnavailableReason } from './lib/sandbox/support';
+import {
+  getMode,
+  getRounds,
+  onAgentResult,
+  requestAgentTask,
+  saveMode,
+  saveRounds,
+  subscribe as subscribeAgentMode,
+  type AgentResult,
+  type RunMode,
+} from './lib/sandbox/mode';
 
 const ThoughtSection: React.FC<{ thought: string; isLive?: boolean }> = ({
   thought,
@@ -189,6 +200,39 @@ export default function App() {
   const [isThinkingActive, setIsThinkingActive] = useState(false);
   const [activeModelUsed, setActiveModelUsed] = useState<string>('');
   const [isSandboxOpen, setIsSandboxOpen] = useState(false);
+  // Chat asks the model once. Agent hands the prompt to the in-browser sandbox loop, where
+  // each tool call is another request. The budget lives in src/lib/sandbox/mode.ts; App only
+  // mirrors it so the composer can show and change what one Enter will cost.
+  const [runMode, setRunMode] = useState<RunMode>(() => getMode());
+  const [agentRounds, setAgentRounds] = useState(() => getRounds());
+  const [pendingAgentReply, setPendingAgentReply] = useState<(AgentResult & { at: number }) | null>(
+    null,
+  );
+  useEffect(
+    () =>
+      subscribeAgentMode(() => {
+        setRunMode(getMode());
+        setAgentRounds(getRounds());
+      }),
+    [],
+  );
+  useEffect(() => onAgentResult((result) => setPendingAgentReply({ ...result, at: Date.now() })), []);
+  useEffect(() => {
+    if (!pendingAgentReply) return;
+    if (!pendingAgentReply.text.trim()) return;
+    const footer = `_agent · used ${pendingAgentReply.roundsUsed} of ${pendingAgentReply.roundsAllowed} tool calls_`;
+    const reply: ChatMessage = {
+      id: `agent-${pendingAgentReply.at}`,
+      role: 'model',
+      text: `${pendingAgentReply.text}\n\n${footer}`,
+      timestamp: pendingAgentReply.at,
+      modelUsed: 'sandbox agent',
+    };
+    const next = [...messages, reply];
+    setMessages(next);
+    syncSessionMessages(next, activeChatId);
+    setPendingAgentReply(null);
+  }, [pendingAgentReply, messages, activeChatId]);
   // Last 10 turns, flattened to text: the sandbox agent needs conversational
   // context, not attachment payloads, and it must not mutate this state.
   const sandboxHistory = useMemo(
@@ -715,6 +759,27 @@ export default function App() {
     const attachmentsToSend = textOverride !== undefined ? [] : [...pendingAttachments];
 
     if ((!prompt && attachmentsToSend.length === 0) || isLoading) return;
+
+    // Agent mode: the composer drives the sandbox loop instead of the chat stream. Deliberately
+    // placed before the cascade/base-URL guards, because an agent task uses the sandbox panel's
+    // own provider fields and never the chat cascade — and before the attachment path, because
+    // file uploads are not part of a tool-call turn.
+    if (runMode === 'agent' && textOverride === undefined && prompt && attachmentsToSend.length === 0) {
+      setInputPrompt('');
+      if (textareaRef.current) textareaRef.current.style.height = 'auto';
+      const userMsg: ChatMessage = {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        text: prompt,
+        timestamp: Date.now(),
+      };
+      const nextHistory = [...messages, userMsg];
+      setMessages(nextHistory);
+      syncSessionMessages(nextHistory, activeChatId);
+      setIsSandboxOpen(true);
+      requestAgentTask(prompt);
+      return;
+    }
 
     if (activeMeta.isCustom && !activeMeta.baseUrl) {
       setStatusBanner('Configure your Custom Provider Base URL in Settings first.');
@@ -2159,6 +2224,38 @@ export default function App() {
               />
             </div>
 
+            <div
+              className="flex shrink-0 items-center gap-0.5 rounded-xl border border-zinc-800 bg-zinc-900 p-0.5"
+              title="Chat: one request per message. Agent: the model writes files and runs commands in the in-browser sandbox — that costs one request per tool call."
+            >
+              {(['chat', 'agent'] as RunMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => saveMode(mode)}
+                  className={`rounded-lg px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors cursor-pointer ${
+                    runMode === mode
+                      ? mode === 'agent'
+                        ? 'bg-cyan-600 text-white'
+                        : 'bg-zinc-700 text-zinc-100'
+                      : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
+                >
+                  {mode}
+                </button>
+              ))}
+              {runMode === 'agent' && (
+                <button
+                  type="button"
+                  onClick={() => setIsSandboxOpen(true)}
+                  title={`Tool-call budget for one task — edit it in the sandbox panel. 1 is the cheapest (a single request), ${getRounds() > 20 ? 'high values can exhaust a daily free quota on one task' : 'safe on a 20/day free key'}.`}
+                  className="rounded-lg bg-zinc-800 px-1.5 py-1 font-mono text-[10px] text-cyan-300 hover:bg-zinc-700 cursor-pointer"
+                >
+                  ≤{agentRounds}
+                </button>
+              )}
+            </div>
+
             <button
               type="button"
               onClick={() => setIsSandboxOpen(true)}
@@ -2178,7 +2275,11 @@ export default function App() {
               onChange={handleTextareaChange}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              placeholder={`Message ${activeMeta.shortLabel}...`}
+              placeholder={
+                runMode === 'agent'
+                  ? `Ask the agent to build or fix something… (≤${agentRounds} tool calls)`
+                  : `Message ${activeMeta.shortLabel}...`
+              }
               rows={1}
               className="flex-1 min-w-0 w-full max-h-40 bg-transparent text-sm px-1.5 sm:px-2 py-1.5 focus:outline-none resize-none leading-relaxed placeholder-zinc-500"
             />

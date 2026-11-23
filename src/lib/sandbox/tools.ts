@@ -11,6 +11,7 @@
 import { runShell } from './runner';
 import { drainPreviewIssues, listDir, readTextFile, writeTextFile } from './container';
 import { relPath, safePath } from './path';
+import { clampRounds } from './mode';
 import { ensureWorkspace } from './project';
 
 export const MAX_TOOL_ROUNDS = 12;
@@ -195,6 +196,10 @@ export type AgentRunOptions = {
   apiKey: string;
   model: string;
   maxTokens?: number;
+  /** Tool-call budget for this task; clamped to MIN/MAX_ROUNDS in mode.ts. */
+  maxRounds?: number;
+  /** Reports real usage once, so the transcript can say "7 of 12". */
+  onStats?: (stats: { roundsUsed: number; roundsAllowed: number }) => void;
   /** 'length' + no tool_calls means the reasoning budget was too small. */
   finishReason?: string | null;
   emit: (event: AgentEvent) => void;
@@ -263,11 +268,17 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
   }
   messages.push({ role: 'user', content: opts.prompt });
 
+  // The ceiling used to be this module's constant. It is now the user's, inside
+  // mode.ts's bounds, because the cost of a task is rounds x requests and free keys
+  // meter requests, not usefulness.
+  const rounds = clampRounds(opts.maxRounds ?? MAX_TOOL_ROUNDS);
+  let roundsUsed = 0;
   let finalText = '';
 
   let revived = false;
 
-  for (let round = 1; round <= MAX_TOOL_ROUNDS; round++) {
+  for (let round = 1; round <= rounds; round++) {
+    roundsUsed = round;
     if (opts.signal?.aborted) {
       opts.emit({ kind: 'log', text: 'stopped' });
       break;
@@ -367,7 +378,7 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
       // done — the iframe has to load first. Give it exactly one revival, so "looks fine"
       // cannot survive a `boom is not defined` that only shows up once the page runs.
       const late = drainPreviewIssues();
-      if (late.length > 0 && !revived && round < MAX_TOOL_ROUNDS) {
+      if (late.length > 0 && !revived && round < rounds) {
         revived = true;
         opts.emit({
           kind: 'log',
@@ -426,11 +437,16 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
       messages.push({ role: 'tool', content: result.output.slice(0, 60_000), tool_call_id: call?.id });
     }
 
-    if (round === MAX_TOOL_ROUNDS) {
-      const note = 'Stopping: 12-tool-call limit reached';
+    if (round === rounds) {
+      const note = `Stopping: ${rounds}-tool-call limit reached`;
       opts.emit({ kind: 'log', text: note });
       finalText = finalText ? `${finalText}\n\n_${note}_` : note;
     }
+  }
+
+  opts.onStats?.({ roundsUsed, roundsAllowed: rounds });
+  if (roundsUsed < rounds) {
+    opts.emit({ kind: 'log', text: `used ${roundsUsed} of ${rounds} tool calls` });
   }
 
   return finalText;
