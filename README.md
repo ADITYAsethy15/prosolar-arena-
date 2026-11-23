@@ -49,6 +49,15 @@ a workspace at `/workspace` you can browse, run tests in, and preview.
   endpoint you already chose. Your API keys never enter the sandbox.
 - Every `shell` command and `write_file` needs your click to run (there's an opt-in auto-approve switch, off by
   default). Reads are free.
+- **`stop` means stop.** It interrupts the model request, kills the command that is currently running (before this
+  it kept going to its own timeout — up to 300 s for an install — which is why `stop` looked dead), and answers an
+  open approval prompt as a rejection so the loop cannot sit there waiting for a click that will never come. You
+  get `stopping…`, then a line saying where it stopped, and the tool budget it had used. A server the agent left
+  running in an *earlier* round keeps serving on purpose — killing that would take your preview away. Closing the
+  panel stops the turn as well, so a backgrounded agent cannot go on spending your quota with nobody watching.
+- The **Files** tab re-reads `/workspace` on `refresh` and says what it found (`7 entries · 4:12:03`), spins while
+  reading, and keeps the previous list if the read fails rather than showing a false "(empty workspace)". A tool
+  round also refreshes the list by itself, so files appear while the agent is still working.
 - Commands are capped at 45 s and 100 KB of output; the agent gets 12 tool rounds per message; the path jail
   keeps every operation inside `/workspace`.
 - Node.js only — no Python, no apt. `npm i` works through StackBlitz's registry proxy, so it needs a network
@@ -57,7 +66,29 @@ a workspace at `/workspace` you can browse, run tests in, and preview.
   The agent is told to switch to `import` or a `.cjs` file, and usually self-corrects in one round.
 - A command ending in `&` is left running instead of being waited on, and whatever port it opens is adopted by
   the **Preview** tab automatically — so "start the dev server and show me" works without typing a port.
-
+- **The preview URL is not a URL you can share, and that is not a bug in this app.** The address the container
+  hands back is a StackBlitz-hosted proxy to the container instance living *in this tab*. The panel's iframe is
+  inside that tab, so it renders; a fresh tab has no container behind it and says the project is not connected.
+  No header, CORS setting or `render.yaml` key changes that — the proxy is not the app's origin. Three controls
+  cover what you actually want:
+  - **fullscreen** enlarges the panel's iframe to cover the window and keeps the container alive, so the app
+    still runs, hot-reloads and talks to its own dev server. `Esc` or **close** puts it back. This is the one to
+    use while the agent is iterating.
+  - **open standalone** makes a copy that *can* leave: `src/lib/sandbox/snapshot.ts` reads `dist/index.html`
+    (falling back to `index.html`) out of `/workspace` and rebuilds it as ONE self-contained document, then opens
+    it from a `blob:` URL in a new tab. Every `<script src>`, `<link href>`, `@import` and `url()` — including
+    ones inside imported stylesheets and inline `style` attributes — is resolved against the workspace and
+    replaced with a `data:` URL, recursively for module graphs (depth 12), because a relative `./util.js` left
+    alone would resolve against the blob and 404. Dev-server hooks like `/@vite/client` are stripped, `</script>`
+    inside inlined code cannot break out of the tag, and a cycle terminates instead of hanging. Ceilings: 4 MB
+    per file, 24 MB per document; anything over, or missing, is left as-is and *reported* under the button in a
+    `skipped` line rather than silently dropped, so the page still opens.
+  - **save .html** writes that same document to disk — no popup to block, no iframe sandbox in the way, and it
+    keeps working after you close the tab.
+  - **raw preview URL** is the old plain link, kept but labelled honestly: it only answers while the tab holding
+    the container is open.
+- A snapshot is a copy, not a tunnel: it captures the workspace at the moment you click, so a dev-server-only
+  project must be built first (`npm run build`), and a page that fetches data from a server still has no server.
 - It requires a cross-origin-isolated top-level page, so it will not run inside an embedded preview iframe —
   the panel tells you to open Solara in a new tab rather than failing mysteriously.
 - `@webcontainer/api` is MIT and free for open-source use per StackBlitz, but depends on their hosted

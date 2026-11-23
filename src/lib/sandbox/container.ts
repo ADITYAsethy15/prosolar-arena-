@@ -1,5 +1,6 @@
 import { PreviewMessageType, WebContainer, type PreviewMessage } from '@webcontainer/api';
 import { parentOf, safePath, WORKSPACE_ROOT } from './path';
+import { buildStandaloneHtml, type SnapshotResult } from './snapshot';
 
 export type FileEntry = { name: string; path: string; dir: boolean };
 
@@ -68,6 +69,47 @@ export async function listTree(root: string = WORKSPACE_ROOT, maxDepth = 3): Pro
   };
   await walk(root, 1);
   return out;
+}
+
+/**
+ * Snapshot the workspace into one self-contained document.
+ *
+ * The preview URL cannot leave this tab (it is a StackBlitz proxy bound to the live
+ * container), but the files behind it can, so we resolve them here and inline them.
+ * A production build is preferred over the source entry, because that is the version
+ * with no dev-server dependencies left in it.
+ */
+export async function snapshotWorkspace(): Promise<SnapshotResult> {
+  const container = await getContainer();
+  const read = async (abs: string): Promise<Uint8Array | null> => {
+    try {
+      return new Uint8Array(await container.fs.readFile(safePath(abs)));
+    } catch {
+      return null;
+    }
+  };
+  const candidates = [
+    `${WORKSPACE_ROOT}/dist/index.html`,
+    `${WORKSPACE_ROOT}/build/index.html`,
+    `${WORKSPACE_ROOT}/index.html`,
+    `${WORKSPACE_ROOT}/public/index.html`,
+  ];
+  let entry = '';
+  let text = '';
+  for (const candidate of candidates) {
+    const bytes = await read(candidate);
+    if (bytes) {
+      entry = candidate;
+      text = new TextDecoder().decode(bytes);
+      break;
+    }
+  }
+  if (!entry) {
+    throw new Error(
+      'nothing to snapshot yet: the workspace has no index.html (or dist/index.html). Ask the agent to build one, or use serve to view it in this tab.',
+    );
+  }
+  return buildStandaloneHtml(entry, text, read);
 }
 
 export async function readTextFile(path: string): Promise<string> {

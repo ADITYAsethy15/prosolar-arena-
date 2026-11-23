@@ -114,11 +114,15 @@ const BACKGROUND_GRACE_MS = 2_500;
 
 export async function runShell(
   cmd: string,
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<RunResult> {
   const trimmed = String(cmd ?? '').trim();
   if (!trimmed) {
     return { exitCode: 1, output: 'empty command' };
+  }
+  if (opts.signal?.aborted) {
+    // Stop was pressed while this call was queued behind another round.
+    return { exitCode: 130, output: 'stopped before the command started' };
   }
   if (PYTHON_LIKE.test(trimmed)) {
     return {
@@ -152,6 +156,42 @@ export async function runShell(
     }
   };
 
+  // --- the stop button, which used to be inert here ------------------------------------
+  // Until v10 the abort signal only reached the provider fetch, so pressing stop during a
+  // tool round did nothing until the command finished on its own — up to 120s, or 300s for
+  // `npm i`, which is exactly how "the stop button is not working" got reported. Killing the
+  // process is the only way to shorten a spawn, and it works (WebContainer has no SIGINT).
+  let aborted = false;
+  let releaseAbort: () => void = () => {};
+  // Same shape as the background grace result, so `settled: false` keeps a stopped
+  // backgrounded command from also claiming it was "left running".
+  const abortRace = new Promise<{ code: number; settled: boolean }>((resolve) => {
+    releaseAbort = () => resolve({ code: -1, settled: false });
+  });
+  const onAbort = () => {
+    aborted = true;
+    try {
+      proc.kill();
+    } catch {
+      // already exited on its own
+    }
+    releaseAbort();
+  };
+  if (opts.signal) {
+    if (opts.signal.aborted) {
+      onAbort();
+    } else {
+      opts.signal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
+  const detachAbort = () => {
+    try {
+      opts.signal?.removeEventListener('abort', onAbort);
+    } catch {
+      // no-op
+    }
+  };
+
   // WebContainer always wires stdout/stderr; piping is the only read path.
   void proc.output.pipeTo(new WritableStream({ write: collect })).catch(() => undefined);
 
@@ -175,7 +215,8 @@ export async function runShell(
       const grace = new Promise<{ code: number; settled: boolean }>((resolve) => {
         setTimeout(() => resolve({ code: 0, settled: true }), BACKGROUND_GRACE_MS);
       });
-      const first = await Promise.race([exited, grace]);
+      // Even the 2.5s "did it crash on boot?" grace must not hold up a stop.
+      const first = await Promise.race([exited, grace, abortRace]);
       exitCode = first.code;
       if (first.settled) {
         // Let the last few chunks land before we read `output` (the server's own
@@ -184,13 +225,23 @@ export async function runShell(
         output += `\n[backgrounded: left running — the Preview tab follows its port; use \`kill\` to stop it]`;
       }
     } else {
-      exitCode = await proc.exit;
+      // A spawn that never exits (an un-backgrounded server) is exactly what a stop is for,
+      // so the abort promise races the exit rather than waiting out a timeout nobody wants.
+      const raced = await Promise.race([proc.exit, abortRace]);
+      exitCode = typeof raced === 'number' ? raced : -1;
     }
   } catch (err) {
     output += `\nspawn error: ${String((err as Error)?.message ?? err)}`;
   }
   if (killer) {
     clearTimeout(killer);
+  }
+  detachAbort();
+  if (aborted) {
+    return {
+      exitCode: 130,
+      output: `${output}\n[stopped: you pressed stop — this command was killed mid-run. A server left\n  running by an earlier round keeps serving; that is deliberate, stopping it would take your preview away]`.trim(),
+    };
   }
 
   let tail = '';

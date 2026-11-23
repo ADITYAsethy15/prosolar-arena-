@@ -16,14 +16,21 @@ import {
   listTree,
   onPreview,
   readTextFile,
+  snapshotWorkspace,
   waitForPreview,
   writeTextFile,
   type FileEntry,
 } from './container';
+import type { SnapshotResult } from './snapshot';
 import { relPath } from './path';
 import { ensureWorkspace } from './project';
 import { runShell } from './runner';
-import { resolveApproval, runAgentTurn, setApprovalSink, type AgentEvent } from './tools';
+import {
+  resolveApproval,
+  runAgentTurn,
+  setApprovalSink,
+  type AgentEvent,
+} from './tools';
 import {
   clampRounds,
   getRounds,
@@ -67,9 +74,16 @@ export default function SandboxPanel({
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [approval, setApproval] = useState<Approval | null>(null);
   const [tree, setTree] = useState<FileEntry[]>([]);
+  const [treeBusy, setTreeBusy] = useState(false);
+  const [treeNote, setTreeNote] = useState('');
   const [viewing, setViewing] = useState<{ path: string; text: string } | null>(null);
   const [prompt, setPrompt] = useState('');
   const [previewUrl, setPreviewUrl] = useState<string>('');
+  const [snapshot, setSnapshot] = useState<SnapshotResult | null>(null);
+  const [snapshotUrl, setSnapshotUrl] = useState('');
+  const [snapshotBusy, setSnapshotBusy] = useState(false);
+  const [snapshotNote, setSnapshotNote] = useState('');
+  const [bigPreview, setBigPreview] = useState(false);
   const [previewPort, setPreviewPort] = useState('5173');
   const [autoApprove, setAutoApprove] = useState<boolean>(
     () => typeof localStorage !== 'undefined' && localStorage.getItem(AUTO_KEY) === '1',
@@ -86,8 +100,28 @@ export default function SandboxPanel({
   const termRef = useRef<{ write: (line: string) => void } | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // A run touches the filesystem dozens of times; refreshing on every event would hammer
+  // WebContainer's fs, so the tool events coalesce into one read a beat later.
+  const treeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const blocked = sandboxUnavailableReason();
   const toolsOk = providerSupportsTools(providerId);
+
+  const refreshTree = useCallback(async () => {
+    setTreeBusy(true);
+    try {
+      const entries = await listTree();
+      setTree(entries);
+      // Silence was the bug: the click did work, it just never said so, so a refresh that
+      // returned the same three files was indistinguishable from a dead button.
+      setTreeNote(`${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} · ${new Date().toLocaleTimeString()}`);
+    } catch (err) {
+      // Keep the old list. Blanketing the pane on a failed read reports an empty workspace
+      // that does not exist, which is worse than a stale one.
+      setTreeNote(`refresh failed: ${String((err as Error)?.message ?? err)}`);
+    } finally {
+      setTreeBusy(false);
+    }
+  }, []);
 
   const log = useCallback((event: AgentEvent) => {
     setEvents((prev) => [...prev.slice(-120), event]);
@@ -97,13 +131,31 @@ export default function SandboxPanel({
       }
       if (event.kind === 'tool') {
         termRef.current?.write(event.output.slice(0, 4000));
+        // Files used to catch up only when the whole task ended, which is why the list looked
+        // frozen (and refresh looked broken) during a long run.
+        if (treeTimer.current) {
+          clearTimeout(treeTimer.current);
+        }
+        treeTimer.current = setTimeout(() => {
+          treeTimer.current = null;
+          void refreshTree();
+        }, 350);
       } else if (event.kind === 'denied') {
         termRef.current?.write('(rejected by user)');
       } else {
         termRef.current?.write(`error: ${event.text}`);
       }
     }
-  }, []);
+  }, [refreshTree]);
+
+  useEffect(
+    () => () => {
+      if (treeTimer.current) {
+        clearTimeout(treeTimer.current);
+      }
+    },
+    [],
+  );
 
   // Boot lazily: opening the panel is the user gesture, and an unavailable
   // sandbox must never cost a fetch of the WebContainer runtime.
@@ -155,18 +207,28 @@ export default function SandboxPanel({
     localStorage.setItem(AUTO_KEY, autoApprove ? '1' : '0');
   }, [autoApprove]);
 
+  // A turn kept running when its panel went away: the loop carried on spending requests with no
+  // UI left to read the answer. Closing the panel, or unmounting it, stops it now.
+  useEffect(() => {
+    if (!open && abortRef.current) {
+      abortRef.current.abort();
+      setRunning(false);
+    }
+  }, [open]);
+
+  useEffect(
+    () => () => {
+      abortRef.current?.abort();
+    },
+    [],
+  );
+
   useEffect(() => {
     const safe = String(Number(maxTokens) || 2048).slice(0, 6);
     localStorage.setItem(TOKENS_KEY, safe);
   }, [maxTokens]);
 
-  const refreshTree = useCallback(async () => {
-    try {
-      setTree(await listTree());
-    } catch {
-      setTree([]);
-    }
-  }, []);
+
 
   // --- terminal (xterm loaded only when that tab is open) ------------------
   useEffect(() => {
@@ -257,12 +319,69 @@ export default function SandboxPanel({
     };
   }, [open, tab, blocked]);
 
+  // A snapshot is a blob URL we own, so it must be revoked when replaced, not leaked.
+  const openStandalone = async () => {
+    setSnapshotBusy(true);
+    setSnapshotNote('');
+    try {
+      const result = await snapshotWorkspace();
+      const url = URL.createObjectURL(new Blob([result.html], { type: 'text/html' }));
+      if (snapshotUrl) {
+        URL.revokeObjectURL(snapshotUrl);
+      }
+      setSnapshot(result);
+      setSnapshotUrl(url);
+      const opened = window.open(url, '_blank');
+      const parts = [
+        `${result.entry.replace('/workspace/', '')} + ${result.inlined.length} file(s) inlined`,
+        result.skipped.length ? `${result.skipped.length} left as-is` : 'nothing left dangling',
+        `${Math.round(result.bytes / 1024)} KB`,
+      ];
+      if (!opened) {
+        parts.push('popup blocked — use save .html');
+      }
+      setSnapshotNote(parts.join(' · '));
+    } catch (err) {
+      setSnapshotNote(String((err as Error)?.message ?? err));
+    } finally {
+      setSnapshotBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!bigPreview) {
+      return;
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setBigPreview(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [bigPreview]);
+
   // --- actions -------------------------------------------------------------
   const answer = (ok: boolean) => {
     if (approval) {
       resolveApproval(approval.id, ok);
     }
     setApproval(null);
+  };
+
+  /**
+   * Stop used to be `abortRef.current?.abort()` alone, which only interrupts the in-flight
+   * model request: a tool round ran to its own timeout (up to 300s for an install) and an
+   * unanswered approval card stayed up forever. That is the report being fixed — "the stop
+   * button is not working". All three phases are covered now: the loop checks the signal,
+   * askApproval resolves a pending prompt as a rejection on it, runShell kills the process on
+   * it. The card itself is cleared by the same signal (askApproval resolves on abort), so it
+   * cannot outlive the turn that raised it — and no other turn's prompt is touched.
+   */
+  const stopTask = () => {
+    abortRef.current?.abort();
+    setApproval(null);
+    setStatus('stopping…');
   };
 
   // `textOverride` lets the composer's Agent mode drive a task without the user
@@ -541,10 +660,13 @@ export default function SandboxPanel({
                   <div className="mb-2 flex gap-2">
                     <button
                       type="button"
-                      onClick={refreshTree}
-                      className="flex items-center gap-1.5 rounded-lg bg-zinc-800 px-2.5 py-1 text-[11px] text-zinc-300 hover:bg-zinc-700"
+                      onClick={() => void refreshTree()}
+                      disabled={treeBusy}
+                      className="flex items-center gap-1.5 rounded-lg bg-zinc-800 px-2.5 py-1 text-[11px] text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
+                      title="Re-read /workspace from the container. The list also updates itself after every tool call."
                     >
-                      <RefreshCw className="h-3 w-3" /> refresh
+                      <RefreshCw className={`h-3 w-3 ${treeBusy ? 'animate-spin' : ''}`} />{' '}
+                      {treeBusy ? 'reading…' : 'refresh'}
                     </button>
                     <button
                       type="button"
@@ -563,6 +685,7 @@ export default function SandboxPanel({
                       />
                     </label>
                   </div>
+                  {treeNote && <p className="mb-1.5 font-mono text-[10px] text-zinc-600">{treeNote}</p>}
                   <ul className="space-y-0.5 font-mono text-[11px]">
                     {tree.map((entry) => (
                       <li key={entry.path}>
@@ -639,18 +762,50 @@ export default function SandboxPanel({
                     >
                       <Play className="h-3 w-3" /> serve /workspace
                     </button>
+                    <button
+                      type="button"
+                      disabled={!previewUrl || bigPreview}
+                      onClick={() => setBigPreview(true)}
+                      className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-[11px] text-zinc-300 hover:bg-zinc-800 disabled:opacity-30"
+                      title="Enlarge the preview to fill the window. It stays inside this tab, which is what keeps it alive."
+                    >
+                      fullscreen
+                    </button>
+                    <button
+                      type="button"
+                      disabled={snapshotBusy}
+                      onClick={() => void openStandalone()}
+                      className="rounded-lg border border-cyan-800/60 bg-cyan-950/40 px-2.5 py-1 text-[11px] text-cyan-200 hover:bg-cyan-900/40 disabled:opacity-40"
+                      title="Copy the workspace into one self-contained .html and open THAT in a new tab. The container URL cannot leave this tab; a snapshot can, and you can save it."
+                    >
+                      {snapshotBusy ? 'bundling\u2026' : 'open standalone'}
+                    </button>
+                    {snapshot && snapshotUrl && (
+                      <a
+                        href={snapshotUrl}
+                        download="preview-standalone.html"
+                        className="self-center text-[11px] text-zinc-400 underline hover:text-zinc-200"
+                        title="The same document, saved to disk. Opens anywhere, no sandbox involved."
+                      >
+                        save .html
+                      </a>
+                    )}
                     {previewUrl && (
                       <a
                         href={previewUrl}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="truncate self-center text-[11px] text-cyan-300 underline"
+                        className="truncate self-center text-[11px] text-zinc-500 underline decoration-dotted hover:text-zinc-300"
+                        title="Only answers while THIS tab is alive and holding the container: it is a proxy to it, not a URL of your site. For anything else use open standalone."
                       >
-                        open in tab
+                        raw preview URL
                       </a>
                     )}
                   </div>
-                  {previewUrl ? (
+                  {snapshotNote && (
+                    <p className="mt-2 text-[11px] text-zinc-500">{snapshotNote}</p>
+                  )}
+                  {previewUrl && !bigPreview ? (
                     <iframe
                       title="Sandbox preview"
                       src={previewUrl}
@@ -661,6 +816,26 @@ export default function SandboxPanel({
                       // is same-origin with is the container's own preview host, never this page's.
                       sandbox="allow-scripts allow-forms allow-modals allow-popups allow-same-origin allow-downloads"
                     />
+                  ) : previewUrl ? (
+                    <div className="fixed inset-0 z-50 flex flex-col bg-black">
+                      <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-950 px-3 py-2">
+                        <span className="truncate font-mono text-[11px] text-zinc-500">{previewUrl}</span>
+                        <span className="shrink-0 text-[11px] text-zinc-600">container preview \u00b7 Esc to return</span>
+                        <button
+                          type="button"
+                          onClick={() => setBigPreview(false)}
+                          className="ml-auto shrink-0 rounded-lg bg-zinc-800 px-2.5 py-1 text-[11px] text-zinc-200 hover:bg-zinc-700"
+                        >
+                          close
+                        </button>
+                      </div>
+                      <iframe
+                        title="Sandbox preview (fullscreen)"
+                        src={previewUrl}
+                        className="w-full flex-1 bg-white"
+                        sandbox="allow-scripts allow-forms allow-modals allow-popups allow-same-origin allow-downloads"
+                      />
+                    </div>
                   ) : (
                     <p className="text-xs text-zinc-600">
                       No preview yet. Any server the agent starts on a port is picked up here automatically; or put
@@ -732,7 +907,8 @@ export default function SandboxPanel({
                 {running && (
                   <button
                     type="button"
-                    onClick={() => abortRef.current?.abort()}
+                    onClick={stopTask}
+                      title="Interrupt everything the agent is doing right now: the model request, the command it is running (killed, not waited out), and the approval prompt if it is parked on one."
                     className="rounded-lg bg-zinc-800 px-3 py-1.5 text-[11px] text-zinc-300 hover:bg-zinc-700"
                   >
                     stop

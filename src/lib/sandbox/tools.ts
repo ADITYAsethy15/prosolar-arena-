@@ -90,17 +90,39 @@ export function resolveApproval(id: string, ok: boolean): void {
   pendingApprovals.delete(id);
 }
 
-function askApproval(tool: string, detail: string): Promise<boolean> {
+function askApproval(tool: string, detail: string, signal?: AbortSignal): Promise<boolean> {
   if (!approvalSink) {
     // No panel attached (e.g. panel closed mid-run): fail closed.
     return Promise.resolve(false);
   }
+  if (signal?.aborted) {
+    return Promise.resolve(false);
+  }
   const id = `ap-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
   return new Promise<boolean>((resolve) => {
-    pendingApprovals.set(id, { resolve });
+    // A prompt parked on a click used to be unstoppable: stop left the loop awaiting a card
+    // nobody would ever answer. An abort answers it as a rejection instead, and `settled`
+    // keeps the click path and the abort path from double-resolving the same entry.
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      pendingApprovals.delete(id);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(ok);
+    };
+    const onAbort = () => done(false);
+    pendingApprovals.set(id, { resolve: done });
+    signal?.addEventListener('abort', onAbort, { once: true });
     approvalSink?.({ id, tool, detail });
   });
 }
+
+// No queue-wide "dismiss everything" on purpose: prompts are keyed to the turn that raised
+// them, and an abort listener per promise gets exactly that one. A global drain answered
+// another, still-running turn's prompt and resumed it (measured in the v10 harness).
 
 // --- tool execution ----------------------------------------------------------
 export type ToolOutcome = { ok: boolean; output: string };
@@ -127,10 +149,17 @@ function previewWrite(path: string, content: string): string {
   }`;
 }
 
-async function execute(name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
+async function execute(
+  name: string,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<ToolOutcome> {
+  if (signal?.aborted) {
+    return { ok: false, output: 'stopped before this tool ran' };
+  }
   try {
     if (name === 'shell') {
-      const res = await runShell(commandOf(args));
+      const res = await runShell(commandOf(args), { signal });
       return { ok: res.exitCode === 0, output: `exit ${res.exitCode}\n${res.output}` };
     }
     if (name === 'read_file') {
@@ -276,11 +305,17 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
   let finalText = '';
 
   let revived = false;
+  let stoppedNote = false;
 
   for (let round = 1; round <= rounds; round++) {
     roundsUsed = round;
     if (opts.signal?.aborted) {
-      opts.emit({ kind: 'log', text: 'stopped' });
+      // Only note it once per stop: the tool loop below already can, and a second line
+      // reading "stopped" under a "stopped mid-round" message is just noise.
+      if (!stoppedNote) {
+        opts.emit({ kind: 'log', text: 'stopped' });
+        finalText = finalText || 'Stopped by you before the next request.';
+      }
       break;
     }
     // Anything the running preview complained about since the last round goes to the model
@@ -334,6 +369,17 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
       }
     } catch (err) {
       const text = String((err as Error)?.message ?? err);
+      if (opts.signal?.aborted) {
+        // Pressing stop is a decision, not a fault: the abort surfaces as an AbortError from
+        // the fetch, and before this it threw straight out of the panel on round 1 — leaving
+        // the chat with no reply and the footer with a raw "This operation was aborted".
+        stoppedNote = true;
+        opts.emit({ kind: 'log', text: `stopped during request ${round}` });
+        finalText = finalText
+          ? `${finalText}\n\n_stopped by you during request ${round}_`
+          : `Stopped by you during request ${round} of ${rounds}.`;
+        break;
+      }
       opts.emit({ kind: 'error', text });
       if (round === 1) {
         throw err;
@@ -413,7 +459,17 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
           name === 'shell'
             ? `shell: ${commandOf(args)}`
             : previewWrite(pathOf(args), contentOf(args));
-        const okToRun = await askApproval(name, detail);
+        const okToRun = await askApproval(name, detail, opts.signal);
+        if (!okToRun && opts.signal?.aborted) {
+          // Rejected *because* you stopped — not a judgement on the command, so do not
+          // phrase it as one, and do not queue a tool reply the model will never read.
+          stoppedNote = true;
+          opts.emit({ kind: 'log', text: 'stopped during the approval prompt' });
+          finalText = finalText
+            ? `${finalText}\n\n_stopped by you while waiting for approval_`
+            : 'Stopped by you while waiting for approval.';
+          break;
+        }
         if (!okToRun) {
           opts.emit({ kind: 'denied', tool: name, detail });
           messages.push({
@@ -425,7 +481,7 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
         }
       }
 
-      const result = await execute(name, args);
+      const result = await execute(name, args, opts.signal);
       opts.emit({
         kind: 'tool',
         round,
@@ -435,6 +491,17 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
         ok: result.ok,
       });
       messages.push({ role: 'tool', content: result.output.slice(0, 60_000), tool_call_id: call?.id });
+      if (opts.signal?.aborted) {
+        // The kill landed mid-command; there is no point firing the remaining calls of this
+        // round, and leaving them without a tool reply would poison the transcript if the
+        // answer is ever resent.
+        stoppedNote = true;
+        opts.emit({ kind: 'log', text: `stopped mid-round (${calls.length - calls.indexOf(call) - 1} call(s) skipped)` });
+        finalText = finalText
+          ? `${finalText}\n\n_stopped by you during round ${round}_`
+          : `Stopped by you during round ${round}.`;
+        break;
+      }
     }
 
     if (round === rounds) {
@@ -445,7 +512,8 @@ export async function runAgentTurn(opts: AgentRunOptions): Promise<string> {
   }
 
   opts.onStats?.({ roundsUsed, roundsAllowed: rounds });
-  if (roundsUsed < rounds) {
+  // On a stop the "stopped" line already says where it ended; a second tally is noise.
+  if (!opts.signal?.aborted && roundsUsed < rounds) {
     opts.emit({ kind: 'log', text: `used ${roundsUsed} of ${rounds} tool calls` });
   }
 
