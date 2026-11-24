@@ -11,7 +11,6 @@ data/
 continuous-study-state.json
 bun.lock
 bun.lockb
-package-lock.json
 
 
 # stale exports that look like the project but are not (v8: removed from the archive)

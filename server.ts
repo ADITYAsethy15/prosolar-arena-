@@ -41,6 +41,7 @@ const REQUEST_TIMEOUT_MS = INITIAL_TIMEOUT_MS;
 const ACTIVE_STREAM_TIMEOUT_MS = ACTIVE_TIMEOUT_MS;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB per file
 const TAVILY_URL = 'https://api.tavily.com/search';
+const TAVILY_EXTRACT_URL = 'https://api.tavily.com/extract';
 
 const longFetchAgent = new Agent({
   connectTimeout: 30_000,
@@ -74,7 +75,7 @@ app.use(express.urlencoded({ limit: '30mb', extended: true }));
 // sets a 7-day HttpOnly cookie; /api/* without it gets 401 JSON.
 // Change PW to rotate the password (change KEY too). No client code changes.
 // ============================================================================
-const PW = 'solarauniversa';
+const PW = 'agentsol';
 const KEY = 'f7471b0f3d5d529a25174e24bcdd4833'; // random cookie value, moves with PW (deliberately NOT the password)
 
 // Whitespace-normalized copies used for the actual comparisons. The password
@@ -1119,6 +1120,83 @@ app.post('/api/search', async (req, res) => {
     return res.json({ sources, query: trimmedQuery });
   } catch (err: any) {
     return res.status(502).json({ error: err?.message || 'Tavily search failed.' });
+  }
+});
+
+// ============================================================================
+// Readable text of one URL (for the sandbox agent's web_fetch tool).
+//
+// Deliberately a separate route from /api/search: searching returns snippets and
+// never a page, and the agent needs the page when the user pastes a link. Uses
+// Tavily's extract endpoint when a key is present (it renders JS and strips
+// navigation), and falls back to a plain fetch plus a tag-stripper otherwise so a
+// project without a Tavily key is not completely blind.
+// ============================================================================
+app.post('/api/fetch-url', async (req, res) => {
+  req.setTimeout(REQUEST_TIMEOUT_MS);
+  res.setTimeout(REQUEST_TIMEOUT_MS);
+
+  const { url, tavilyKey } = req.body as { url?: string; tavilyKey?: string };
+  const target = String(url || '').trim();
+  if (!/^https?:\/\//i.test(target)) {
+    return res.status(400).json({ error: 'A full http(s) URL is required.' });
+  }
+
+  const key = (tavilyKey || '').trim();
+  try {
+    if (key) {
+      const upstream = await fetch(TAVILY_EXTRACT_URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls: [target], extract_depth: 'basic' }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      const raw = await upstream.text();
+      if (!upstream.ok) {
+        return res.status(upstream.status).json({ error: extractErrorMessage(raw, upstream.status) });
+      }
+      const data = JSON.parse(raw);
+      const row = Array.isArray(data?.results) ? data.results[0] : null;
+      const text = typeof row?.raw_content === 'string' ? row.raw_content : '';
+      if (text.trim()) {
+        return res.json({ url: target, title: typeof row?.title === 'string' ? row.title : target, text: text.slice(0, 60_000) });
+      }
+      // No extractable content: fall through to the plain fetch rather than return "".
+    }
+
+    const upstream = await fetch(target, {
+      headers: { 'User-Agent': 'Solara/1.0 (+sandbox web_fetch)', Accept: 'text/html,text/plain' },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ error: `fetch failed with HTTP ${upstream.status}` });
+    }
+    const type = String(upstream.headers.get('content-type') || '');
+    const body = (await upstream.text()).slice(0, 400_000);
+    if (!/html/i.test(type)) {
+      return res.json({ url: target, title: target, text: body.slice(0, 60_000) });
+    }
+    const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(body)?.[1]?.trim() ?? target;
+    const text = body
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/<\/(p|div|section|article|li|h[1-6]|tr|br)>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return res.json({ url: target, title, text: text.slice(0, 60_000) });
+  } catch (err: any) {
+    return res.status(502).json({ error: err?.message || 'Web fetch failed.' });
   }
 });
 

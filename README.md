@@ -34,40 +34,58 @@ Honest free-tier caveats, before you hit deploy:
 - **100-minute maximum request duration**, comfortably above the 10-min/20-min stream budgets in `server.ts`,
   so long reasoning cascades survive.
 - **Free Postgres is not used** — there is no database here, so its 30-day expiry can't bite you.
-- `npm install` needs the committed `package-lock.json`; it exists now, which matters because `esbuild` was
-  pinned to a range that Vite 8 rejects and a lockfile-less `npm install` fails with `ERESOLVE`.
+- `npm ci` needs the committed `package-lock.json` — and `.gitignore` used to ignore exactly that file, so a
+  Git-deployed Render build resolved fresh ranges instead (a different `undici`/`esbuild` than the app is tested
+  against). The lockfile is tracked now and `render.yaml` runs `npm ci && npm run build`.
+- `render.yaml` also sets `NODE_VERSION=22.20.0`. Node 20 fails at import time
+  (`TypeError: Cannot read properties of undefined (reading 'bind')` in `undici`'s zstd decompressor), which
+  looks like an app bug and is not one.
 
 Node 22 is required (`undici@8` refuses to load on older majors; `engines` and `.node-version` pin it).
 
 ### Sandbox (files, shell, tests, previews) — in your browser tab
 
 The terminal icon in the composer opens the **Sandbox** panel: a real Node.js runtime (WebContainers) running
-inside the tab, driven by the model through four tools — `shell`, `read_file`, `write_file`, `list_dir` — with
-a workspace at `/workspace` you can browse, run tests in, and preview.
+inside the tab, driven by the model through **12 project tools** exposed as an in-memory **MCP server**, with a
+persistent `/bin/jsh` terminal, real `ripgrep`, a live preview and a completion gate. The execution framework is
+ported from [bolt.diy](https://github.com/stackblitz-labs/bolt.diy); `SANDBOX-RUNTIME.md` is the module-by-module
+map and the reasoning behind each piece.
 
 - Nothing runs on the server, nothing is stored on the server, and nothing is sent anywhere except the model
   endpoint you already chose. Your API keys never enter the sandbox.
-- Every `shell` command and `write_file` needs your click to run (there's an opt-in auto-approve switch, off by
-  default). Reads are free.
-- **`stop` means stop.** It interrupts the model request, kills the command that is currently running (before this
-  it kept going to its own timeout — up to 300 s for an install — which is why `stop` looked dead), and answers an
-  open approval prompt as a rejection so the loop cannot sit there waiting for a click that will never come. You
-  get `stopping…`, then a line saying where it stopped, and the tool budget it had used. A server the agent left
-  running in an *earlier* round keeps serving on purpose — killing that would take your preview away. Closing the
-  panel stops the turn as well, so a backgrounded agent cannot go on spending your quota with nobody watching.
-- The **Files** tab re-reads `/workspace` on `refresh` and says what it found (`7 entries · 4:12:03`), spins while
-  reading, and keeps the previous list if the read fails rather than showing a false "(empty workspace)". A tool
-  round also refreshes the list by itself, so files appear while the agent is still working.
-- Commands are capped at 120 s (5 min for `npm i`/`npm run`, 4 min for a build) and their output tail at 100 KB;
-  the agent gets up to **24** tool rounds per message (the `tool calls` box, 1–60); the path jail
-  keeps every operation inside `/workspace`. Every run prints the two numbers it is limited by —
+- **The tools are a real MCP client/server pair** (`@modelcontextprotocol/sdk`, `InMemoryTransport`): reads
+  (`project_read_file`, `project_list_paths`, `project_search_content`, `project_find_related_files`), writes
+  (`project_write_file`, `project_replace_lines`, `project_patch_file`, `project_create_directory`,
+  `project_delete_path`), processes (`project_run_command`, `project_get_process_output`, `project_stop_process`),
+  and research (`web_search`, `web_fetch`, relayed through this app's server).
+- **Writes are validated before they are saved.** A `.ts`/`.tsx`/`.js` file is parsed with Prettier's own parser
+  first; a syntax error comes back to the model with the line and a hint instead of a bundler error three rounds
+  later. Edits go through line-range patches guarded by a SHA-256 revision, so a stale patch is a hard conflict
+  rather than a silent clobber.
+- **Commands are processes, not strings.** `project_run_command` returns a `processId`: installs are polled to
+  exit code 0 before a dependent command may start, a repeated `run` reuses the live server instead of binding the
+  port twice, and every output is real (exit codes are not scraped from a shared shell).
+- **A completion gate the model cannot talk past.** `agent_plan` before edits; `agent_complete` is refused unless
+  a check passed *after* the last edit and the last failure, and every planned criterion is reported by id. When
+  the model stops early, the loop tells it the single next required action. Preview exceptions and
+  `console.error`s are fed into the following round, so "it renders" cannot survive `boom is not defined`.
+- **`stop` means stop.** It interrupts the model request, kills the running command (before this it ran to its
+  own timeout — up to 300 s for an install — which is why `stop` looked dead), and answers an open approval
+  prompt as a rejection. Closing the panel stops the turn as well.
+- **Approvals** cover every mutating call and `project_run_command` (opt-in auto-approve, off by default).
+  **Lock a file or folder** in the Files tab and the agent's write to it is refused with a message it can read.
+- Commands are capped at 120 s (5 min for installs) with a 100 KB output tail; the agent gets up to **24**
+  tool calls per message (the `tool calls` box, 1–60). Every run prints what it is limited by —
   `budget: 24 tool call(s), up to 8,192 tokens per turn` — so a truncated turn is never mistaken for a lazy model.
 - Node.js only — no Python, no apt. `npm i` works through StackBlitz's registry proxy, so it needs a network
-  connection, and files are per-session (export/import the workspace as a `.zip` to keep it).
+  connection. The project **persists in IndexedDB** across reloads (text files only), and exports/imports as a
+  `.zip`; `reset` wipes the workspace and its processes.
 - The workspace is an ES module (`package.json` has `"type": "module"`), so `require(...)` in a `.js` file fails.
   The agent is told to switch to `import` or a `.cjs` file, and usually self-corrects in one round.
-- A command ending in `&` is left running instead of being waited on, and whatever port it opens is adopted by
-  the **Preview** tab automatically — so "start the dev server and show me" works without typing a port.
+- A command ending in `&` is left running instead of being waited on, and whatever port a server opens is adopted
+  by the **Preview** tab automatically. The **Terminal** tab is an interactive `/bin/jsh` session of your own;
+  agent commands are spawned as their own processes and mirrored into it, which is what keeps a dev server from
+  blocking the next tool call.
 - **The preview URL is not a URL you can share, and that is not a bug in this app.** The address the container
   hands back is a StackBlitz-hosted proxy to the container instance living *in this tab*. The panel's iframe is
   inside that tab, so it renders; a fresh tab has no container behind it and says the project is not connected.
@@ -212,11 +230,34 @@ const KEY = 'change this too '; // random cookie value, moves with PW
         └── TavilySettings.tsx       # Connection Settings modal (API keys, Custom #1/#2, Tavily config)
 ```
 
+### Sandbox runtime (`src/lib/sandbox/`), ported from bolt.diy
+
+```
+path.ts              # two-root jail: /workspace (tools) <-> /home/project (container)
+container.ts         # boot once, fs, preview-port registry, preview-error queue
+project.ts           # tracked file map, generation counter, mutation queue, locks
+bootstrap.ts         # restore from IndexedDB -> scaffold -> index
+persist.ts           # IndexedDB project persistence (text only, debounced)
+terminal.ts          # interactive /bin/jsh --osc session for the Terminal tab
+runner.ts            # one command = one process: timeout, abort, output cap, error hints
+sourceCheck.ts       # numbered reads, revision-guarded line patches, parse-before-save
+ripgrep.ts           # rg.wasm over a WASI preopen of the project (+ public/rg.wasm)
+projectTools.ts      # the 12 tool schemas, defined once; JSON Schema via z.toJSONSchema
+projectMcp.ts        # MCP server + client, process registry, install gating, web relay
+provider.ts          # one model turn through /api/sandbox/turn
+loop.ts              # agent loop, progress record, completion gate
+snapshotWorkspace.ts # build-then-inline one self-contained .html
+Panel.tsx            # activity / files / terminal / preview UI
+runtime.test.ts      # vitest: jail, patches, parse-before-save, completion gate
+```
+
 ---
 
 ## Getting Started
 
 ### Prerequisites
+
+Node **22.19+**. Not cosmetic: `undici@8` refuses to load on older majors (`TypeError: Cannot read properties of undefined (reading 'bind')` in `zstdDecompress`), and `@modelcontextprotocol/sdk` declares `node >=22.19`. `engines` and `.node-version` pin 22; if your shell has 20, use `nvm use` first.
 
 - **Node.js 20+** (recommended `22.x`)
 - **npm**
@@ -267,7 +308,8 @@ APP_URL="MY_APP_URL"
 | `/api/chat` | `POST` | Non-streaming cascade completion endpoint (used for Tavily model query-intent planning and direct calls). |
 | `/api/chat/abort` | `POST` | Aborts an active `requestId` controller server-side to stop upstream token generation immediately. |
 | `/api/upload` | `POST` | Converts up to 12 uploaded files (max 25 MB each) into base64 attachment payloads. |
-| `/api/search` | `POST` | Stateless proxy to `https://api.tavily.com/search` supporting depth, result limit, and allow/block domain filters. |
+| `/api/search` | `POST` | Stateless proxy to `https://api.tavily.com/search` supporting depth, result limit, and allow/block domain filters. Backs the agent's `web_search` tool. |
+| `/api/fetch-url` | `POST` | Readable text of one URL for the agent's `web_fetch` tool: Tavily `extract` when a key is supplied, otherwise a plain fetch plus an HTML-to-text pass. Same request budget as `/api/search`. |
 
 ### SSE Event Types (`/api/chat/stream`)
 

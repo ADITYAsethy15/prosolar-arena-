@@ -4,11 +4,18 @@ services:
     runtime: node
     plan: free
     region: oregon
-    buildCommand: npm install && npm run build
+    # npm ci, not npm install: the lockfile is committed (see .gitignore — it used to
+    # be ignored, which silently made a Render build resolve fresh ranges and
+    # installed a newer undici/esbuild than the app is tested against).
+    buildCommand: npm ci && npm run build
     startCommand: npm start
     healthCheckPath: /healthz
     autoDeploy: true
+    # Node 22 is not cosmetic: undici@8 refuses to load on 20 and the MCP SDK
+    # declares >=22.19. .node-version pins it too; this makes Render agree.
     envVars:
+      - key: NODE_VERSION
+        value: "22.20.0"
       # Render caps ONE HTTP RESPONSE at 100 minutes (not an idle window: a total lifetime
       # ceiling), and long enough for our 20-minute active-stream cap, so the Cloud Run
       # handoff ladder has nothing to protect against here. Legs are widened until only

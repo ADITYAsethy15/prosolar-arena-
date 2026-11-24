@@ -1,6 +1,19 @@
+// ============================================================================
+// WebContainer lifecycle, filesystem, previews and preview-error forwarding.
+//
+// This module is the single owner of the container instance. Everything above it
+// (project store, MCP tool server, terminal, agent loop, panel) talks through
+// these functions, so the two-root split in path.ts and the "boot exactly once"
+// rule live in exactly one place.
+//
+// Ported structure from bolt.diy's app/lib/webcontainer/index.ts and
+// app/lib/stores/previews.ts, adapted to this app: no Vite HMR data, no
+// nanostores, and a path jail that also understands the legacy /workspace form.
+// ============================================================================
 import { PreviewMessageType, WebContainer, type PreviewMessage } from '@webcontainer/api';
-import { parentOf, safePath, WORKSPACE_ROOT } from './path';
-import { buildStandaloneHtml, type SnapshotResult } from './snapshot';
+import { parentOf, toContainerPath, toVirtualPath, WORK_DIR_NAME, WORKSPACE_ROOT } from './path';
+
+export { toContainerPath, toVirtualPath } from './path';
 
 export type FileEntry = { name: string; path: string; dir: boolean };
 
@@ -13,42 +26,49 @@ export function getContainer(): Promise<WebContainer> {
   if (!bootPromise) {
     bootPromise = WebContainer.boot({
       coep: 'credentialless',
-      // WebContainer injects a tiny reporter into preview iframes and posts what the page
-      // logs/throws back to us. Without this the agent is blind to its own running app:
-      // a page that renders fine but throws on load looks like total success.
+      // bolt.diy pins the workdir name too; it keeps `path.relative` results clean and
+      // makes the project root addressable as /home/project in tool output.
+      workdirName: WORK_DIR_NAME,
+      // WebContainer injects a tiny reporter into preview iframes and posts what the
+      // page logs/throws back to us. Without this the agent is blind to its own
+      // running app: a page that renders but throws on load looks like total success.
       forwardPreviewErrors: true,
     })
       .then((booted) => {
         wirePreviewMessages(booted);
+        // Adopt any port a previous page-load opened before the listeners were wired.
         return booted;
       })
       .catch((err: unknown) => {
-      // A failed boot must not poison the singleton forever.
-      bootPromise = null;
-      throw err;
-    });
+        // A failed boot must not poison the singleton forever.
+        bootPromise = null;
+        throw err;
+      });
   }
   return bootPromise;
 }
 
+// --- filesystem -------------------------------------------------------------
+
 export async function listDir(dir: string = WORKSPACE_ROOT): Promise<FileEntry[]> {
   const container = await getContainer();
-  const base = safePath(dir);
-  const entries = await container.fs.readdir(base, { withFileTypes: true });
+  const virtual = dir === WORKSPACE_ROOT ? WORKSPACE_ROOT : dir;
+  const real = toContainerPath(virtual);
+  const entries = await container.fs.readdir(real, { withFileTypes: true });
   return entries
     .map((entry) => ({
       name: entry.name,
-      path: base === WORKSPACE_ROOT ? `${WORKSPACE_ROOT}/${entry.name}` : `${base}/${entry.name}`,
+      path: virtual === WORKSPACE_ROOT ? `${WORKSPACE_ROOT}/${entry.name}` : `${virtual}/${entry.name}`,
       dir: entry.isDirectory(),
     }))
     .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
 }
 
-/** Recursive listing, depth-limited, skipping node_modules — for the Files tab. */
+/** Recursive listing, depth-limited, skipping node_modules/.git — for the Files tab. */
 export async function listTree(root: string = WORKSPACE_ROOT, maxDepth = 3): Promise<FileEntry[]> {
   const out: FileEntry[] = [];
   const walk = async (dir: string, depth: number): Promise<void> => {
-    if (depth > maxDepth || out.length >= 400) {
+    if (depth > maxDepth || out.length >= 800) {
       return;
     }
     let entries: FileEntry[] = [];
@@ -58,7 +78,7 @@ export async function listTree(root: string = WORKSPACE_ROOT, maxDepth = 3): Pro
       return;
     }
     for (const entry of entries) {
-      if (entry.name === 'node_modules' || entry.name === '.git') {
+      if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === '.cache') {
         continue;
       }
       out.push(entry);
@@ -71,150 +91,92 @@ export async function listTree(root: string = WORKSPACE_ROOT, maxDepth = 3): Pro
   return out;
 }
 
-/**
- * Snapshot the workspace into one self-contained document.
- *
- * The preview URL cannot leave this tab (it is a StackBlitz proxy bound to the live
- * container), but the files behind it can, so we resolve them here and inline them.
- * A production build is preferred over the source entry, because that is the version
- * with no dev-server dependencies left in it.
- */
-/**
- * `import './style.css'` and bare specifiers are bundler features. A Vite project that has
- * never been built therefore cannot be snapshotted from source no matter how good the
- * inliner is — so the panel is allowed to build it first, in the container, and snapshot
- * the result. Deliberately not routed through runner.ts: that module imports getContainer
- * from here, and the cycle would be resolved at bundle time for no benefit.
- */
-async function buildCommandFor(pkgJsonText: string | null): Promise<string> {
-  if (!pkgJsonText) {
-    return 'npx vite build';
-  }
-  let pkg: Record<string, unknown>;
-  try {
-    pkg = JSON.parse(pkgJsonText) as Record<string, unknown>;
-  } catch {
-    return 'npx vite build';
-  }
-  const scripts = (pkg.scripts ?? {}) as Record<string, unknown>;
-  if (typeof scripts.build === 'string' && scripts.build.trim()) {
-    return 'npm run build';
-  }
-  const deps = { ...(pkg.dependencies as object | undefined), ...(pkg.devDependencies as object | undefined) };
-  if (deps && typeof deps === 'object' && 'vite' in deps) {
-    return 'npx vite build';
-  }
-  return '';
-}
-
-async function runBuild(container: any, cmd: string): Promise<{ exitCode: number; output: string }> {
-  const proc = await container.spawn('sh', ['-c', cmd], {
-    cwd: '/workspace',
-    env: { FORCE_COLOR: '0', NO_COLOR: '1', npm_config_yes: 'true' },
-  });
-  let output = '';
-  const collector = new WritableStream({
-    write: (chunk: string) => {
-      if (output.length < 40_000) {
-        output += chunk;
-      }
-    },
-  });
-  void proc.output.pipeTo(collector).catch(() => undefined);
-  const BUILD_TIMEOUT_MS = 240_000;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const raced = await Promise.race([
-    proc.exit.then((code: number) => ({ code: Number(code), timedOut: false })),
-    new Promise<{ code: number; timedOut: boolean }>((resolve) => {
-      timer = setTimeout(() => resolve({ code: 124, timedOut: true }), BUILD_TIMEOUT_MS);
-    }),
-  ]);
-  if (timer) {
-    clearTimeout(timer);
-  }
-  if (raced.timedOut) {
-    try {
-      proc.kill();
-    } catch {
-      // already gone
-    }
-  }
-  return { exitCode: raced.timedOut ? 124 : raced.code, output: output.trim().slice(-3_000) };
-}
-
-export async function snapshotWorkspace(opts: { buildFirst?: boolean } = {}): Promise<SnapshotResult> {
+export async function readBytes(path: string): Promise<Uint8Array> {
   const container = await getContainer();
-  const read = async (abs: string): Promise<Uint8Array | null> => {
-    try {
-      return new Uint8Array(await container.fs.readFile(safePath(abs)));
-    } catch {
-      return null;
-    }
-  };
-  if (opts.buildFirst) {
-    const pkgBytes = await read(`${WORKSPACE_ROOT}/package.json`);
-    const cmd = await buildCommandFor(pkgBytes ? new TextDecoder().decode(pkgBytes) : null);
-    if (!cmd) {
-      throw new Error('no "build" script in package.json and no vite dependency — nothing to build. Snapshot from source still works for plain JS.');
-    }
-    const built = await runBuild(container, cmd);
-    if (built.exitCode !== 0) {
-      throw new Error(`build failed (${cmd}, exit ${built.exitCode}):\n${built.output || 'no output'}`);
-    }
-  }
-  const candidates = [
-    `${WORKSPACE_ROOT}/dist/index.html`,
-    `${WORKSPACE_ROOT}/build/index.html`,
-    `${WORKSPACE_ROOT}/index.html`,
-    `${WORKSPACE_ROOT}/public/index.html`,
-  ];
-  let entry = '';
-  let text = '';
-  for (const candidate of candidates) {
-    const bytes = await read(candidate);
-    if (bytes) {
-      entry = candidate;
-      text = new TextDecoder().decode(bytes);
-      break;
-    }
-  }
-  if (!entry) {
-    throw new Error(
-      'nothing to snapshot yet: the workspace has no index.html (or dist/index.html). Ask the agent to build one, or use serve to view it in this tab.',
-    );
-  }
-  const result = await buildStandaloneHtml(entry, text, read);
-  if (result.needsBuild && !opts.buildFirst) {
-    // Not a failure — the page will simply be missing whatever needed a bundler. Say so in a
-    // way the panel can turn into a button, instead of shipping a blank-looking copy.
-    result.skipped.push({
-      ref: 'build',
-      path: entry,
-      reason: 'this entry needs a bundler — press "build then open" for a faithful copy',
-    });
-  }
-  return result;
+  return new Uint8Array(await container.fs.readFile(toContainerPath(path)));
 }
 
 export async function readTextFile(path: string): Promise<string> {
   const container = await getContainer();
-  return container.fs.readFile(safePath(path), 'utf8');
+  return container.fs.readFile(toContainerPath(path), 'utf8');
 }
 
 export async function writeTextFile(path: string, content: string): Promise<string> {
   const container = await getContainer();
-  const target = safePath(path);
-  await container.fs.mkdir(parentOf(target), { recursive: true });
-  await container.fs.writeFile(target, content, 'utf8');
-  return target;
+  const real = toContainerPath(path);
+  await container.fs.mkdir(parentOf(real), { recursive: true });
+  await container.fs.writeFile(real, content, 'utf8');
+  return toVirtualPath(real);
 }
 
+export async function writeBytes(path: string, bytes: Uint8Array): Promise<string> {
+  const container = await getContainer();
+  const real = toContainerPath(path);
+  await container.fs.mkdir(parentOf(real), { recursive: true });
+  await container.fs.writeFile(real, bytes);
+  return toVirtualPath(real);
+}
+
+export async function mkdir(path: string): Promise<string> {
+  const container = await getContainer();
+  const real = toContainerPath(path);
+  await container.fs.mkdir(real, { recursive: true });
+  return toVirtualPath(real);
+}
+
+export async function removePath(path: string, recursive = true): Promise<void> {
+  const container = await getContainer();
+  await container.fs.rm(toContainerPath(path), { recursive, force: true });
+}
+
+export async function pathExists(path: string): Promise<boolean> {
+  try {
+    await readBytes(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// --- previews -----------------------------------------------------------------
 // WebContainer 1.6.x exposes preview URLs only through the 'port' and
 // 'server-ready' events (there is no synchronous getPreviewUrl), so the URLs are
 // recorded as they happen and waiters are drained from that registry.
+
+export type PreviewInfo = { port: number; url: string; ready: boolean };
+
 const previewUrls = new Map<number, string>();
 const previewWaiters = new Map<number, Set<(url: string) => void>>();
+const previewWatchers = new Set<(info: PreviewInfo[]) => void>();
 let listenersWired: Promise<void> | null = null;
+
+function snapshot(): PreviewInfo[] {
+  return [...previewUrls.entries()]
+    .map(([port, url]) => ({ port, url, ready: true }))
+    .sort((a, b) => a.port - b.port);
+}
+
+function publish(): void {
+  const list = snapshot();
+  for (const notify of [...previewWatchers]) {
+    try {
+      notify(list);
+    } catch {
+      // a broken subscriber must never break WebContainer's event loop
+    }
+  }
+}
+
+function drain(port: number, url: string): void {
+  const waiters = previewWaiters.get(port);
+  if (!waiters) {
+    return;
+  }
+  previewWaiters.delete(port);
+  for (const resolve of waiters) {
+    resolve(url);
+  }
+}
 
 async function ensurePreviewListeners(): Promise<void> {
   if (!listenersWired) {
@@ -227,59 +189,73 @@ async function ensurePreviewListeners(): Promise<void> {
         } else {
           previewUrls.delete(port);
         }
+        publish();
       });
       container.on('server-ready', (port, url) => {
         previewUrls.set(port, url);
         drain(port, url);
+        publish();
       });
     })();
   }
   return listenersWired;
 }
 
-function drain(port: number, url: string): void {
-  for (const notify of previewWatchers) {
-    try {
-      notify(port, url);
-    } catch {
-      // a broken subscriber must never break WebContainer's event loop
-    }
-  }
-  const waiters = previewWaiters.get(port);
-  if (!waiters) {
-    return;
-  }
-  previewWaiters.delete(port);
-  for (const resolve of waiters) {
-    resolve(url);
-  }
-}
-
-// startPreview() only knows about servers IT spawned. But the agent spawns plenty of
-// servers by itself (`node server.js &`), and those fire the same port events — so the
-// panel subscribes here and adopts whatever port the sandbox actually opened.
-const previewWatchers = new Set<(port: number, url: string) => void>();
-
-export function onPreview(notify: (port: number, url: string) => void): () => void {
+/** Subscribe to the live preview list. Adopts already-open ports immediately. */
+export function onPreview(notify: (info: PreviewInfo[]) => void): () => void {
   previewWatchers.add(notify);
   void ensurePreviewListeners();
-  // Adopt an already-open port too: the agent may have started the server before the
-  // Preview tab was ever mounted, and 'port' events do not repeat.
-  for (const [port, url] of previewUrls) {
-    try {
-      notify(port, url);
-    } catch {
-      // ignore
-    }
+  try {
+    notify(snapshot());
+  } catch {
+    // ignore
   }
   return () => {
     previewWatchers.delete(notify);
   };
 }
 
-// --- preview issues -------------------------------------------------------
-// Known wart: focusing the Preview tab swaps this hidden watcher for the visible iframe,
-// so the page reloads once. Cheap compared to the alternative (no error feedback at all).
+export function listPreviews(): PreviewInfo[] {
+  return snapshot();
+}
+
+export function previewUrlFor(port: number): string | null {
+  return previewUrls.get(port) ?? null;
+}
+
+/**
+ * Resolves the container's own preview URL for a port, waiting for it to appear
+ * if the dev server has not bound yet. No port scanning, no proxy: the iframe
+ * gets this URL and nothing else.
+ */
+export async function waitForPreview(port: number, timeoutMs = 25_000): Promise<string> {
+  await ensurePreviewListeners();
+  const immediate = previewUrls.get(port);
+  if (immediate) {
+    return immediate;
+  }
+  return new Promise<string>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      previewWaiters.get(port)?.delete(waiter);
+      reject(new Error(`Nothing is listening on port ${port} after ${Math.round(timeoutMs / 1000)}s.`));
+    }, timeoutMs);
+    const waiter = (url: string) => {
+      settled = true;
+      clearTimeout(timer);
+      resolve(url);
+    };
+    const set = previewWaiters.get(port) ?? new Set<(url: string) => void>();
+    set.add(waiter);
+    previewWaiters.set(port, set);
+  });
+}
+
+// --- preview issues -----------------------------------------------------------
 // Everything the running preview complains about, queued for the next model round.
 // Fed to the model rather than only shown in the UI: bolt.diy stops at an alert card,
 // but the agent can actually fix these, which is the whole point of having a preview.
@@ -298,9 +274,7 @@ function describePreviewIssue(message: PreviewMessage): string {
     return `console.error (${where}) ${args || '(no args)'}`.slice(0, 500);
   }
   const kind =
-    message.type === PreviewMessageType.UnhandledRejection
-      ? 'unhandled promise rejection'
-      : 'uncaught exception';
+    message.type === PreviewMessageType.UnhandledRejection ? 'unhandled promise rejection' : 'uncaught exception';
   const stack = String(message.stack ?? '')
     .split('\n')
     .slice(1, 4)
@@ -333,7 +307,9 @@ function wirePreviewMessages(container: WebContainer): void {
 
 export function onPreviewIssue(notify: (line: string) => void): () => void {
   previewIssueSubs.add(notify);
-  return () => previewIssueSubs.delete(notify);
+  return () => {
+    previewIssueSubs.delete(notify);
+  };
 }
 
 /** Take everything queued so far (used by the agent loop before it calls the model). */
@@ -341,39 +317,6 @@ export function drainPreviewIssues(): string[] {
   return previewIssues.splice(0, previewIssues.length);
 }
 
-export function previewUrlFor(port: number): string | null {
-  return previewUrls.get(port) ?? null;
-}
-
-/**
- * Resolves the container's own preview URL for a port, waiting for it to appear
- * if the dev server has not bound yet. No port scanning, no proxy: the iframe
- * gets this URL and nothing else.
- */
-export async function waitForPreview(port: number, timeoutMs = 25_000): Promise<string> {
-  await ensurePreviewListeners();
-  const immediate = previewUrls.get(port);
-  if (immediate) {
-    return immediate;
-  }
-  return new Promise<string>((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      const set = previewWaiters.get(port);
-      set?.delete(waiter);
-      reject(new Error(`Nothing is listening on port ${port} after ${Math.round(timeoutMs / 1000)}s.`));
-    }, timeoutMs);
-    const waiter = (url: string) => {
-      settled = true;
-      clearTimeout(timer);
-      resolve(url);
-    };
-    const set = previewWaiters.get(port) ?? new Set<(url: string) => void>();
-    set.add(waiter);
-    previewWaiters.set(port, set);
-  });
+export function previewIssueCount(): number {
+  return previewIssues.length;
 }

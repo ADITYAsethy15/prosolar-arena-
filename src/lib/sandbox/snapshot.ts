@@ -16,6 +16,24 @@
 
 export type SnapshotRead = (absPath: string) => Promise<Uint8Array | null>;
 
+/**
+ * A bundler-free copy has to resolve every reference through a path space. The
+ * workspace used to be addressed as `/workspace/...` everywhere; the container's
+ * real workdir is `/home/project` (see path.ts), so both are accepted and
+ * `node_modules` is looked up in the workspace whichever spelling the entry used.
+ */
+const ALIASES: Array<{ test: RegExp; canonical: (p: string) => string }> = [
+  { test: /^\/home\/project(?:\/|$)/, canonical: (p) => `/workspace${p.slice('/home/project'.length)}` },
+];
+function canonicalPath(abs: string): string {
+  for (const alias of ALIASES) {
+    if (alias.test.test(abs)) {
+      return alias.canonical(abs);
+    }
+  }
+  return abs;
+}
+
 export type SnapshotSkip = { ref: string; path: string; reason: string };
 
 export type SnapshotResult = {
@@ -250,6 +268,9 @@ export async function buildStandaloneHtml(
   entryHtml: string,
   read: SnapshotRead,
 ): Promise<SnapshotResult> {
+  // Every read goes through the path space in one place, so a snapshot taken from
+  // either spelling of the workspace resolves the same file.
+  const readFile: SnapshotRead = (abs) => read(canonicalPath(abs));
   const inlined: string[] = [];
   const skipped: SnapshotSkip[] = [];
   const entryDir = relDirOf(entryAbs);
@@ -327,14 +348,14 @@ export async function buildStandaloneHtml(
     if (!local) {
       return null;
     }
-    if (await read(local)) {
+    if (await readFile(local)) {
       return local;
     }
     const dot = local.lastIndexOf('.');
     const slash = local.lastIndexOf('/');
     if (dot < slash) {
       for (const guess of want === 'css' ? [`${local}.css`, `${local}/index.css`] : [`${local}.js`, `${local}/index.js`, `${local}.mjs`]) {
-        if (await read(guess)) {
+        if (await readFile(guess)) {
           return guess;
         }
       }
@@ -343,7 +364,7 @@ export async function buildStandaloneHtml(
   };
 
   const readText = async (abs: string): Promise<string | null> => {
-    const bytes = await read(abs);
+    const bytes = await readFile(abs);
     if (!bytes) {
       return null;
     }
@@ -362,7 +383,7 @@ export async function buildStandaloneHtml(
     if (hit) {
       return hit;
     }
-    const bytes = await read(abs);
+    const bytes = await readFile(abs);
     if (!bytes) {
       return fail(ref, abs, 'not found in /workspace');
     }
