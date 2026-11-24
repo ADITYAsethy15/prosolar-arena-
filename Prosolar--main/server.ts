@@ -755,6 +755,45 @@ function detectSoftError(json: any): string | null {
   return null;
 }
 
+/**
+ * Parallel tool calls: the whole point is that one response can carry several calls, so
+ * N edits cost one request instead of N. OpenAI's API defaults this on, but gateways
+ * differ — some omit the field, some (older Azure deployments, a few compat shims)
+ * reject it with a 400 naming the parameter. Retrying without it costs one extra request
+ * only in the failing case, and it means the flag can never be what breaks a provider.
+ */
+async function fetchWithParallelFlag(
+  body: Record<string, unknown>,
+  call: (extra: Record<string, unknown>) => Promise<{
+    ok: boolean;
+    status: number;
+    text: () => Promise<string>;
+    body?: unknown;
+  }>,
+  onNote?: (note: string) => void,
+): Promise<{ response: Awaited<ReturnType<typeof call>>; dropped: boolean }> {
+  const wanted = body.parallelToolCalls !== false;
+  if (!wanted) {
+    return { response: await call({}), dropped: false };
+  }
+  let response = await call({ parallel_tool_calls: true });
+  if (response.ok) {
+    return { response, dropped: false };
+  }
+  const raw = await response.text().catch(() => '');
+  const rejectsParam =
+    (response.status === 400 || response.status === 422) &&
+    /parallel_tool_calls|unknown (field|parameter)|unsupported (field|parameter)|unrecognized/i.test(raw);
+  if (!rejectsParam) {
+    // Rebuild the error response: the caller needs the body it just consumed.
+    const replay = { ...response, text: async () => raw } as typeof response;
+    return { response: replay, dropped: false };
+  }
+  onNote?.('this provider rejects parallel_tool_calls — retried with one tool call per round');
+  response = await call({});
+  return { response, dropped: true };
+}
+
 app.post('/api/sandbox/turn', async (req, res) => {
   // Deliberately NOT INITIAL_TIMEOUT_MS (10 min): an agent turn is interactive, and a
   // provider that accepts the connection then stalls should surface as an error the user
@@ -813,23 +852,28 @@ app.post('/api/sandbox/turn', async (req, res) => {
   res.on('close', onClientGone);
 
   try {
-    const upstream = await undiciFetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        stream: false,
-        ...(maxTokens ? { max_tokens: maxTokens } : {}),
-        ...(tools ? { tools, tool_choice: body.toolChoice === 'none' ? 'none' : 'auto' } : {}),
-      }),
-      signal: controller.signal as any,
-      dispatcher: longFetchAgent,
-    });
+    const { response: upstream, dropped: parallelDropped } = await fetchWithParallelFlag(
+      body,
+      (extra) =>
+        undiciFetch(`${baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            stream: false,
+            ...(maxTokens ? { max_tokens: maxTokens } : {}),
+            ...(tools ? { tools, tool_choice: body.toolChoice === 'none' ? 'none' : 'auto' } : {}),
+            ...extra,
+          }),
+          signal: controller.signal as any,
+          dispatcher: longFetchAgent,
+        }) as Promise<any>,
+    );
 
     const raw = await upstream.text();
     if (!upstream.ok) {
@@ -884,6 +928,7 @@ app.post('/api/sandbox/turn', async (req, res) => {
 
     return res.json({
       ok: true,
+      ...(parallelDropped ? { parallelDropped: true } : {}),
       message: {
         role: 'assistant',
         content,
@@ -907,6 +952,248 @@ app.post('/api/sandbox/turn', async (req, res) => {
     return res.status(502).json({ error: String(err?.message ?? err) });
   } finally {
     clearTimeout(killer);
+    res.off('close', onClientGone);
+  }
+});
+
+// ============================================================================
+// Streaming agent turn (SSE).
+//
+// The agent loop used to call the blocking route below, so a 20-second round looked
+// like a frozen tab: bolt.diy streams every token of every answer and every file
+// delta, and that is most of why it *feels* alive. This route forwards the
+// provider's own SSE frames to the browser, translating OpenAI-style deltas into
+// four small event types the panel already knows how to render.
+//
+// What is deliberately NOT forwarded: provider-specific reasoning fields, usage
+// frames counted twice, and the `[DONE]` sentinel (the client gets an explicit
+// `done` event with the finish reason instead).
+// ============================================================================
+app.post('/api/sandbox/stream', async (req, res) => {
+  req.setTimeout(SANDBOX_TURN_TIMEOUT_MS);
+  res.setTimeout(SANDBOX_TURN_TIMEOUT_MS);
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
+  const apiKey = String(body.apiKey || '').trim();
+  const model = String(body.model || '').trim();
+  const messages = Array.isArray(body.messages) ? (body.messages as unknown[]).slice(0, 64) : [];
+  const tools = Array.isArray(body.tools) ? (body.tools as unknown[]).slice(0, 24) : undefined;
+
+  let host = '';
+  try {
+    host = new URL(baseUrl).hostname;
+  } catch {
+    host = '';
+  }
+  const loopback = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+  if (!/^https:\/\//i.test(baseUrl) && !(loopback && /^http:\/\//i.test(baseUrl))) {
+    return res.status(400).json({ error: 'baseUrl must be an https URL (http is allowed only for localhost)' });
+  }
+  if (!apiKey || !model || messages.length === 0) {
+    return res.status(400).json({ error: 'apiKey, model and messages are required' });
+  }
+
+  const requestedMaxTokens = Number(body.maxTokens);
+  const maxTokens =
+    Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0
+      ? Math.max(256, Math.min(32_000, Math.round(requestedMaxTokens)))
+      : undefined;
+
+  const controller = new AbortController();
+  const killer = setTimeout(() => controller.abort(), SANDBOX_TURN_TIMEOUT_MS);
+  const onClientGone = () => controller.abort(new Error('Client disconnected mid-turn'));
+  res.on('close', onClientGone);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const send = (payload: Record<string, unknown>) => {
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    }
+  };
+  // A proxy that idles for ~30s will cut the stream; comment frames keep it warm and
+  // are ignored by the EventSource parser on the client.
+  const keepalive = setInterval(() => {
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(': keepalive\n\n');
+    }
+  }, 15_000);
+
+  try {
+    const { response: upstream, dropped: parallelDropped } = await fetchWithParallelFlag(
+      body,
+      (extra) =>
+        undiciFetch(`${baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            stream: true,
+            // Without this some gateways omit the tool-call deltas entirely in stream mode.
+            stream_options: { include_usage: true },
+            ...(maxTokens ? { max_tokens: maxTokens } : {}),
+            ...(tools ? { tools, tool_choice: body.toolChoice === 'none' ? 'none' : 'auto' } : {}),
+            ...extra,
+          }),
+          signal: controller.signal as any,
+          dispatcher: longFetchAgent,
+        }) as Promise<any>,
+    );
+    if (parallelDropped) {
+      send({ type: 'note', text: 'provider rejects parallel_tool_calls — one tool call per round' });
+    }
+
+    if (!upstream.ok || !upstream.body) {
+      const raw = await upstream.text().catch(() => '');
+      const paidForUnknown = upstream.status === 402 && /paid model|credits/i.test(raw);
+      send({
+        type: 'error',
+        error: paidForUnknown
+          ? `that model id is not available free on this account (HTTP 402 from provider) — Kilo free models end in ":free". Provider said: ${raw.slice(0, 240)}`
+          : `upstream ${upstream.status}: ${raw.slice(0, 600)}`,
+      });
+      return res.end();
+    }
+
+    // OpenAI-style tool calls arrive as INDEXED fragments: the first chunk carries
+    // id/name and every later chunk carries another slice of the JSON arguments.
+    // Reassembling them here (rather than in the browser) means the client only ever
+    // sees a complete call, which is what the loop dispatches on.
+    const toolCalls: Array<{ id: string; type: string; function: { name: string; arguments: string } }> = [];
+    let content = '';
+    let reasoning = '';
+    let finishReason: string | null = null;
+    let usage: unknown = null;
+
+    const reader = (upstream.body as ReadableStream<Uint8Array>).getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const handleLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) {
+        return;
+      }
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === '[DONE]') {
+        return;
+      }
+      let json: any;
+      try {
+        json = JSON.parse(payload);
+      } catch {
+        return;
+      }
+      if (json?.usage) {
+        usage = json.usage;
+      }
+      const choice = json?.choices?.[0];
+      if (!choice) {
+        return;
+      }
+      if (choice.finish_reason) {
+        finishReason = choice.finish_reason;
+      }
+      const delta = choice.delta ?? choice.message ?? {};
+      const textDelta =
+        typeof delta.content === 'string'
+          ? delta.content
+          : Array.isArray(delta.content)
+            ? delta.content.map((part: any) => part?.text ?? '').join('')
+            : '';
+      const reasoningDelta =
+        typeof delta.reasoning_content === 'string'
+          ? delta.reasoning_content
+          : typeof delta.reasoning === 'string'
+            ? delta.reasoning
+            : '';
+
+      if (reasoningDelta) {
+        reasoning += reasoningDelta;
+        send({ type: 'reasoning', text: reasoningDelta });
+      }
+      if (textDelta) {
+        content += textDelta;
+        send({ type: 'text', text: textDelta });
+      }
+
+      const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+      for (const call of calls) {
+        const index = Number.isInteger(call?.index) ? call.index : toolCalls.length;
+        while (toolCalls.length <= index) {
+          toolCalls.push({ id: '', type: 'function', function: { name: '', arguments: '' } });
+        }
+        const slot = toolCalls[index];
+        if (call.id) {
+          slot.id = call.id;
+        }
+        if (call?.function?.name) {
+          slot.function.name += call.function.name;
+        }
+        if (typeof call?.function?.arguments === 'string') {
+          slot.function.arguments += call.function.arguments;
+        }
+        send({ type: 'tool_delta', index, name: slot.function.name, arguments: slot.function.arguments });
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      // SSE frames are newline-delimited; keep the trailing partial line for the next chunk.
+      let index: number;
+      while ((index = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, index);
+        buffer = buffer.slice(index + 1);
+        handleLine(line);
+      }
+    }
+    if (buffer) {
+      handleLine(buffer);
+    }
+
+    // Some providers stream tool calls with no id at all. The loop needs a stable key
+    // to pair each result with its call, so synthesise one rather than dropping it.
+    const cleanCalls = toolCalls
+      .filter((call) => call.function.name)
+      .map((call, index) => ({
+        id: call.id || `call_${index}_${Date.now().toString(36)}`,
+        type: 'function',
+        function: { name: call.function.name, arguments: call.function.arguments || '{}' },
+      }));
+
+    send({
+      type: 'done',
+      content,
+      toolCalls: cleanCalls,
+      finishReason,
+      usage,
+      ...(reasoning ? { reasoning: reasoning.slice(-20_000) } : {}),
+    });
+    return res.end();
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      send({ type: 'error', error: 'agent turn aborted' });
+    } else {
+      send({ type: 'error', error: String(err?.message ?? err) });
+    }
+    return res.end();
+  } finally {
+    clearTimeout(killer);
+    clearInterval(keepalive);
     res.off('close', onClientGone);
   }
 });

@@ -149,3 +149,77 @@ line patch that is off by one, a check that ran before the last edit, a completi
 gate that accepts a plan as a result. They do not cover the container (needs a
 browser), so the first real task you run in the panel is the integration test:
 `scaffold a Vite + React counter app, start it, and show me the preview`.
+
+---
+
+## Streaming, diffs and the thread (v10)
+
+bolt.diy does three things this panel did not, and they are the difference the user noticed:
+
+| Capability | bolt.diy | v9 here | v10 here |
+| --- | --- | --- | --- |
+| Model output while it is generating | token stream in the assistant bubble | blocking request, whole reply at the end | `/api/sandbox/stream` SSE, coalesced into one live bubble (60 ms flush), `thinking` deltas optional |
+| Reviewing a change | per-file diff view | the file's new contents, if you opened it | `change` event with `+/-` counts and a unified patch; badges in the tree, diff toggle in the viewer, changed-files strip in Activity |
+| Conversation across reloads | persisted thread | project files persisted, transcript lost | transcript persisted to IndexedDB (400 events) next to the project |
+
+**Streaming contract.** `POST /api/sandbox/stream` validates an https-or-loopback upstream, forces
+`stream: true` with `stream_options.include_usage`, and re-emits `reasoning` / `text` / `tool_delta` frames,
+then one `done` with the assembled content, tool calls, finish reason and usage. `tool_delta.arguments` is
+cumulative per index, so a client never has to concatenate fragments itself. 15 s keepalive comments keep
+proxies from closing a reasoning model's long pause. `provider.ts` falls back to the blocking route on any
+stream error, so an upstream that ignores `stream` still works.
+
+**Why the stream is reassembled on both sides.** Providers index tool-call fragments and may omit `id` or
+`name` on later fragments. The server fills both in and only ever emits a monotonically growing argument
+string; the client parses once, at `done`. Anything else means the argument JSON is parsed mid-token.
+
+**Diff contract.** `lineDiff(before, after)` is an LCS over lines, exported for tests. It collapses unchanged
+runs to one `… N unchanged line(s)` marker and falls back to remove-all/add-all past 400 000 cells, which is
+what keeps a large lockfile from freezing the tab. `change` events carry at most 20 000 characters of patch;
+the panel keeps the newest 60 paths.
+
+**One gotcha worth remembering.** Adding a variant to the `AgentEvent` union breaks `ActivityRow`'s
+fallthrough return type (TS2339 on `ok`/`tool`/`detail`). Every new event kind needs its own branch *before*
+the tool `<details>` return. This bit twice.
+
+---
+
+## Batching tool calls (v11)
+
+A round trip is the expensive unit, not a tool call. One response can carry several
+`tool_calls`, and the loop always supported that — the ceiling was a hard-coded
+`slice(0, 8)` and a system prompt that never said "batch", so a model wrote one file per
+round and a five-file scaffold cost five requests.
+
+What changed:
+
+| Knob | Where | Meaning |
+| --- | --- | --- |
+| **requests** | `mode.ts` `ROUNDS_KEY` | how many model requests the task may spend (unchanged, 1–60, default 24) |
+| **calls/request** | `mode.ts` `BATCH_KEY` | how many tool calls may come back in ONE response (1–16, default 8) |
+| **batch** (checkbox) | `PARALLEL_KEY` | send `parallel_tool_calls` upstream at all; off = one call per round |
+| **max tokens** | `TOKENS_KEY` | the size ceiling for a single answer (unchanged, 500–32 000) |
+
+All four are still user-controlled and persisted; none replaced another.
+
+**Wire behaviour.** `provider.ts` sends `parallel_tool_calls: true` unless the toggle is
+off. `server.ts` wraps the upstream call in `fetchWithParallelFlag()`, which retries once
+without the field when a gateway answers 400/422 naming the parameter (older Azure
+deployments and some compat shims do), and reports the downgrade as a `note` event rather
+than failing the turn. Measured both paths against a mock that rejects the field on
+purpose: the retry succeeds and `parallelDropped` is true.
+
+**Why the ceiling exists at all.** One response carrying 16 writes is 16 approval
+prompts, one very long answer that can hit `max_tokens` mid-call (losing the whole
+batch), and no interleaved chance to react. Batching is best for independent work —
+scaffolding files, several reads — and worst for dependent steps, which the system prompt
+now spells out ("only split a step out when it depends on the result of the one before
+it: install before run, run before reading an error").
+
+**Token accounting.** Each turn's `usage` is summed into `{prompt, completion, reasoning,
+total}` and emitted as a `usage` event after *every* turn, so the panel's counter moves
+while the agent works, and once more at the end. `reported: false` means the provider sent
+no `usage` at all (some proxies drop it in stream mode) and the panel prints `≥` instead
+of a confident number. The chat footer reports **requests and tool calls separately** —
+the old footer labelled the request count "tool calls", which made a correctly batched
+turn look wrong.

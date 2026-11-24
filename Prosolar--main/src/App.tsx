@@ -220,7 +220,15 @@ export default function App() {
   useEffect(() => {
     if (!pendingAgentReply) return;
     if (!pendingAgentReply.text.trim()) return;
-    const footer = `_agent · used ${pendingAgentReply.roundsUsed} of ${pendingAgentReply.roundsAllowed} tool calls_`;
+    // Two different numbers, both worth showing: requests are what a metered key is
+    // billed for, tool calls are what the "tool calls" budget counts. The old footer
+    // called the request count "tool calls", which read as a bug when a batched turn
+    // used 5 calls in 1 request.
+    const cost = pendingAgentReply.totalTokens
+      ? ` · ${pendingAgentReply.totalTokens.toLocaleString()} tokens`
+      : '';
+    const calls = pendingAgentReply.toolCalls ? ` · ${pendingAgentReply.toolCalls} tool calls` : '';
+    const footer = `_agent · ${pendingAgentReply.roundsUsed} of ${pendingAgentReply.roundsAllowed} requests${calls}${cost}_`;
     const reply: ChatMessage = {
       id: `agent-${pendingAgentReply.at}`,
       role: 'model',

@@ -99,13 +99,16 @@ zip -qr prosolar-sandbox-bolt.zip Prosolar--main \
   -x "Prosolar--main/node_modules/*" -x "Prosolar--main/dist/*"
 ```
 
-Checksums for the shipped archive:
-
-```
-sha256  57239b203436ef1bbfda93f8b1e4efc5a4bbdd92deb96c7670532f856ae5a185
-size    4557890 bytes uncompressed, ~2.4 MB zipped, 69 files
-```
+This build ships as `prosolar-sandbox-bolt.zip` (~2.4 MB, 71 files, no `node_modules`,
+no `dist`). evapfile URLs are content-addressed, so the hash **in the URL** is the
+sha-256 of the archive — a download is verified by hashing it and comparing to that.
+(The hash is deliberately not written into this file: any edit here changes the
+archive's checksum, so a literal would be stale the moment it was saved.)
 
 Verify a download with
 `curl -s https://evapfile.space/<hash>.zip | sha256sum` — evapfile addresses files by
-their sha-256, so the hash in the URL is the checksum.
+their sha-256, so the hash in the URL is the checksum. This archive was unpacked in a
+clean directory and re-verified: `npm ci` (357 packages) → `npx vitest run` (29/29) →
+`npm run build` (`dist/rg.wasm` present) → `npm start` → `/healthz` `{"ok":true}` →
+unlock → `/api/sandbox/stream` returned a full SSE turn (reasoning, text, tool_delta,
+done with usage).

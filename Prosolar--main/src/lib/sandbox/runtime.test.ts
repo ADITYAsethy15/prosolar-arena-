@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { projectRelative, relPath, safePath, toContainerPath, toVirtualPath, WORK_DIR, WORKSPACE_ROOT } from './path';
 import { countLines, getFileRevision, numberLines, replaceLines, replaceText, validateProjectSource } from './sourceCheck';
-import { getProgress, completionProblems, nextInstruction, MAX_GATE_NUDGES, type AgentPlan } from './loop';
+import { getProgress, completionProblems, nextInstruction, lineDiff, MAX_GATE_NUDGES, type AgentPlan } from './loop';
 import { allToolDefsForProvider, parseToolArguments, AGENT_TOOL_NAMES, PROJECT_TOOL_NAMES } from './projectTools';
 import { reasoningOnly } from './provider';
 
@@ -257,5 +257,39 @@ describe('reasoning-only turns are diagnosed, not retried blindly', () => {
       }),
     ).toBe(false);
     expect(reasoningOnly({ content: '', toolCalls: [], finishReason: 'stop', usage: null })).toBe(false);
+  });
+});
+
+describe('diffs are what a user actually reads', () => {
+  it('classifies added, removed and unchanged lines', () => {
+    const diff = lineDiff('a\nb\nc', 'a\nB\nc');
+    expect(diff.filter((line) => line.kind === 'add').map((line) => line.text)).toEqual(['B']);
+    expect(diff.filter((line) => line.kind === 'remove').map((line) => line.text)).toEqual(['b']);
+    expect(diff.filter((line) => line.kind === 'same').map((line) => line.text)).toEqual(['a', 'c']);
+  });
+
+  it('collapses long unchanged stretches so the change stays visible', () => {
+    const before = Array.from({ length: 40 }, (_, index) => `line ${index}`).join('\n');
+    const after = before.replace('line 20', 'line 20 changed');
+    const diff = lineDiff(before, after);
+    // Two unchanged runs collapse to 3 lines + marker + 3 lines each, so the whole
+    // rendering stays around a dozen rows no matter how long the file is.
+    expect(diff.length).toBeLessThanOrEqual(18);
+    expect(diff.some((line) => line.text.includes('unchanged line(s)'))).toBe(true);
+    expect(diff.find((line) => line.kind === 'add')?.text).toBe('line 20 changed');
+  });
+
+  it('treats a brand-new file as all additions and an empty file as no diff', () => {
+    expect(lineDiff('', 'x\ny').filter((line) => line.kind === 'add')).toHaveLength(2);
+    expect(lineDiff('', '')).toEqual([]);
+    expect(lineDiff('same', 'same')).toEqual([]);
+  });
+
+  it('does not hang on a pathologically large file', () => {
+    const big = Array.from({ length: 2000 }, (_, index) => `l${index}`).join('\n');
+    const started = Date.now();
+    const diff = lineDiff(big, `${big}\nextra`);
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(diff[diff.length - 1]).toEqual({ kind: 'add', text: 'extra' });
   });
 });

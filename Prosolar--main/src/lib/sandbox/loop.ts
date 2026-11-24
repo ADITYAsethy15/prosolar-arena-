@@ -18,16 +18,24 @@
 // That is what makes a small model usable for real work: the sequence lives in the
 // harness, not in the model's willingness to follow a 40-line prompt.
 // ============================================================================
-import { callModel, reasoningOnly, type ProviderTurnRequest } from './provider';
+import { callModel, reasoningOnly, type ProviderTurnAnswer, type ProviderTurnRequest } from './provider';
 import { callProjectTool, parseToolArguments, type ToolResult } from './projectMcp';
 import { allToolDefsForProvider } from './projectTools';
 import { projectStore } from './project';
 import { drainPreviewIssues, listPreviews } from './container';
-import { clampRounds } from './mode';
+import { clampBatch, clampRounds } from './mode';
 
 export const MAX_AGENT_STEPS = 32;
 /** How many times the gate may hand the model a "NEXT REQUIRED ACTION" it ignored. */
 export const MAX_GATE_NUDGES = 2;
+
+/**
+ * Tool calls allowed in one model response. The ceiling is a guard-rail, not a
+ * capability: one response carrying 16 writes is 16 approval prompts and a very long
+ * single answer, and a model that batches badly runs out of `max_tokens` mid-call and
+ * loses the whole batch. 8 is the default because that is a whole small scaffold.
+ */
+export { MIN_BATCH, MAX_BATCH, DEFAULT_BATCH, clampBatch } from './mode';
 
 export type AgentEvent =
   | { kind: 'round'; round: number; limit: number }
@@ -36,7 +44,27 @@ export type AgentEvent =
   | { kind: 'text'; text: string }
   | { kind: 'log'; text: string }
   | { kind: 'error'; text: string }
-  | { kind: 'gate'; problems: string[]; next: string };
+  | { kind: 'gate'; problems: string[]; next: string }
+  /** A file/command change worth showing as a diff or a line, with the byte sizes involved. */
+  | { kind: 'change'; path: string; action: 'created' | 'updated' | 'deleted' | 'unchanged'; added: number; removed: number; diff: string }
+  /**
+   * What the task has cost so far. Emitted after every turn (so the counter moves while
+   * the agent works) and once at the end with the final totals.
+   */
+  | {
+      kind: 'usage';
+      toolCalls: number;
+      requests: number;
+      promptTokens: number;
+      completionTokens: number;
+      reasoningTokens: number;
+      totalTokens: number;
+      /** False when the provider sent no `usage` at all — the count is a floor, not a total. */
+      reported: boolean;
+    }
+  /** Live token deltas for the round in flight; `reset` starts a new assistant message. */
+  | { kind: 'stream'; text: string; reset?: boolean }
+  | { kind: 'thinking'; text: string; reset?: boolean };
 
 export type AgentPlan = {
   goal: string;
@@ -333,7 +361,35 @@ const SYSTEM_PROMPT = [
   'Treat tool output as the source of truth. Report failed commands as failed and do not claim a file changed until a tool result confirms it.',
   'Keep runtime load light: do not run a production build unless asked, and only run install when package.json changed or node_modules is missing.',
   'Give brief progress updates in plain text between tool calls. Be concise: decide, then act.',
+  'BATCH YOUR TOOL CALLS. Every round costs the user one request, so emit as many independent calls as one response allows: all the files of a scaffold in one reply, then an install plus the reads you already know you need. Only split a step out when it depends on the result of the one before it (install before run, run before reading an error).',
 ].join('\n');
+
+/**
+ * Sum one turn's `usage` into the running totals. Providers report `prompt_tokens` /
+ * `completion_tokens`; some proxies omit usage entirely on streams, which is why the
+ * panel labels the number "≥" when `reported` is false rather than showing a confident 0.
+ */
+function accumulateUsage(
+  totals: { prompt: number; completion: number; reasoning: number; total: number },
+  usage: ProviderTurnAnswer['usage'] | undefined,
+): boolean {
+  if (!usage || typeof usage !== 'object') {
+    return false;
+  }
+  const pick = (value: unknown) => (Number.isFinite(Number(value)) ? Math.max(0, Math.round(Number(value))) : 0);
+  const prompt = pick(usage.prompt_tokens ?? (usage as Record<string, unknown>).input_tokens);
+  const completion = pick(usage.completion_tokens ?? (usage as Record<string, unknown>).output_tokens);
+  const reasoning = pick(usage.completion_tokens_details?.reasoning_tokens);
+  const total = pick(usage.total_tokens) || prompt + completion;
+  if (prompt + completion + total === 0) {
+    return false;
+  }
+  totals.prompt += prompt;
+  totals.completion += completion;
+  totals.reasoning += reasoning;
+  totals.total += total;
+  return true;
+}
 
 export type RunOptions = {
   prompt: string;
@@ -343,9 +399,30 @@ export type RunOptions = {
   model: string;
   maxTokens?: number;
   maxRounds?: number;
+  /**
+   * Tool calls the model may put in ONE response (1–16). This is the knob that decides
+   * how many round trips a task costs: 5 file writes either arrive as one request with
+   * five calls, or as five requests with one call each. It is separate from
+   * `maxRounds` (how many requests the task may spend) and from `maxTokens` (how big
+   * any single answer may be), because those answer different questions.
+   */
+  maxToolCallsPerRound?: number;
+  /** Let the gateway batch calls in one response. Off = one call per round, always. */
+  parallelToolCalls?: boolean;
   signal?: AbortSignal;
   emit: (event: AgentEvent) => void;
-  onStats?: (stats: { roundsUsed: number; roundsAllowed: number; upstreamCalls: number }) => void;
+  /** Stream the model's reasoning trace into the activity log (off by default: it is noise for most users). */
+  showThinking?: boolean;
+  onStats?: (stats: {
+    roundsUsed: number;
+    roundsAllowed: number;
+    upstreamCalls: number;
+    toolCalls: number;
+    promptTokens: number;
+    completionTokens: number;
+    reasoningTokens: number;
+    totalTokens: number;
+  }) => void;
 };
 
 /** One job of the whole loop. Returns the final prose the model produced. */
@@ -373,10 +450,31 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
   let upstreamCalls = 0;
   let denied = false;
   let stopped = false;
+  // Token accounting, summed from each turn's `usage`. Nothing else in the app knows
+  // what a task cost, and on a metered key that is the number people actually want.
+  const tokens = { prompt: 0, completion: 0, reasoning: 0, total: 0 };
+  let toolCallsRun = 0;
+  const batchSize = clampBatch(options.maxToolCallsPerRound);
+  /** Did any turn actually report usage? If not the counter understates, and says so. */
+  let usageReported = false;
+  const emitUsage = () =>
+    options.emit({
+      kind: 'usage',
+      toolCalls: toolCallsRun,
+      requests: upstreamCalls,
+      promptTokens: tokens.prompt,
+      completionTokens: tokens.completion,
+      reasoningTokens: tokens.reasoning,
+      totalTokens: tokens.total,
+      reported: usageReported,
+    });
 
   options.emit({
     kind: 'log',
-    text: `budget: ${rounds} model request(s), up to ${(options.maxTokens ?? 8192).toLocaleString()} tokens per turn — plus at most ${MAX_GATE_NUDGES} gate nudge(s) and 1 summary request`,
+    text:
+      `budget: ${rounds} model request(s), up to ${batchSize} tool call(s) per request, ` +
+      `${(options.maxTokens ?? 8192).toLocaleString()} tokens per answer — plus at most ` +
+      `${MAX_GATE_NUDGES} gate nudge(s) and 1 summary request`,
   });
 
   for (let round = 1; round <= rounds; round++) {
@@ -406,6 +504,10 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
     options.emit({ kind: 'round', round, limit: rounds });
 
     let answer;
+    // Live deltas, so a 20-second round is visibly working instead of looking hung.
+    // The panel buffers them into one growing bubble and replaces it with the final
+    // `text` event, which is why a stream never has to be reconciled with the answer.
+    options.emit({ kind: 'stream', text: '', reset: true });
     const request: ProviderTurnRequest = {
       baseUrl: options.baseUrl,
       apiKey: options.apiKey,
@@ -413,7 +515,16 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
       messages,
       tools,
       maxTokens: options.maxTokens,
+      parallelToolCalls: options.parallelToolCalls !== false,
       signal: options.signal,
+      onNote: (note) => options.emit({ kind: 'log', text: note }),
+      onDelta: (delta) => {
+        if (delta.text) {
+          options.emit({ kind: 'stream', text: delta.text });
+        } else if (delta.reasoning && options.showThinking) {
+          options.emit({ kind: 'thinking', text: delta.reasoning });
+        }
+      },
     };
     try {
       upstreamCalls += 1;
@@ -453,7 +564,22 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
       }
     }
 
-    const toolCalls = Array.isArray(answer.toolCalls) ? answer.toolCalls.slice(0, 8) : [];
+    if (accumulateUsage(tokens, answer.usage)) {
+      usageReported = true;
+      emitUsage();
+    }
+
+    // Everything the model asked for in this one response, up to the batch ceiling.
+    // The previous hard-coded 8 was invisible to the user and silently truncated a
+    // batch that a model had already paid to generate.
+    const asked = Array.isArray(answer.toolCalls) ? answer.toolCalls : [];
+    const toolCalls = asked.slice(0, batchSize);
+    if (asked.length > toolCalls.length) {
+      options.emit({
+        kind: 'log',
+        text: `model asked for ${asked.length} tool calls in one response; running the first ${toolCalls.length} (raise "calls/request" to allow more)`,
+      });
+    }
 
     // Round-trip the assistant turn WITH its tool_calls: an assistant message that
     // omits them makes the model re-issue the identical call forever.
@@ -548,8 +674,14 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
 
       const record: CallRecord = { id: call.id, name, args, failed: false, position: calls.length + 1 };
       calls.push(record);
+      toolCallsRun += 1;
 
+      const before = snapshotBefore(name, args);
       const outcome = await runOneTool(name, args, options, calls);
+      const change = buildChange(name, args, before, outcome);
+      if (change) {
+        options.emit(change);
+      }
       record.result = outcome.result;
       record.failed = Boolean(outcome.result.isError);
       if (outcome.denied) {
@@ -597,7 +729,17 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
     finalText = finalText ? `${finalText}\n\n_stopped by you_` : 'Stopped by you.';
   }
 
-  options.onStats?.({ roundsUsed: stepCount, roundsAllowed: rounds, upstreamCalls });
+  emitUsage();
+  options.onStats?.({
+    roundsUsed: stepCount,
+    roundsAllowed: rounds,
+    upstreamCalls,
+    toolCalls: toolCallsRun,
+    promptTokens: tokens.prompt,
+    completionTokens: tokens.completion,
+    reasoningTokens: tokens.reasoning,
+    totalTokens: tokens.total,
+  });
   return finalText;
 }
 
@@ -721,6 +863,149 @@ async function runOneTool(
       denied: false,
     };
   }
+}
+
+/**
+ * Content of the file a write/patch is about to touch, so a diff can be shown.
+ * Read from the store the tools themselves write to, which is why it is synchronous
+ * and free — no extra round trip to the container.
+ */
+function snapshotBefore(name: string, args: Record<string, unknown>): string | null {
+  if (name !== 'project_write_file' && name !== 'project_replace_lines' && name !== 'project_patch_file') {
+    return null;
+  }
+  const path = typeof args.path === 'string' ? args.path : '';
+  if (!path) {
+    return null;
+  }
+  try {
+    const virtual = path.startsWith('/') ? path : `/workspace/${path.replace(/^\.\//, '')}`;
+    const entry = projectStore.files[virtual];
+    return entry?.type === 'file' ? entry.content : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildChange(
+  name: string,
+  args: Record<string, unknown>,
+  before: string | null,
+  outcome: { result: ToolResult },
+): Extract<AgentEvent, { kind: 'change' }> | null {
+  const structured = (outcome.result.structuredContent ?? {}) as Record<string, unknown>;
+  if (name === 'project_delete_path' && structured.deleted === true) {
+    return {
+      kind: 'change',
+      path: String(structured.path ?? args.path ?? ''),
+      action: 'deleted',
+      added: 0,
+      removed: before ? before.split('\n').length : 0,
+      diff: '',
+    };
+  }
+  const isWrite = name === 'project_write_file' || name === 'project_replace_lines' || name === 'project_patch_file';
+  if (!isWrite || outcome.result.isError || structured.changed === false) {
+    return null;
+  }
+  const path = String(structured.path ?? args.path ?? '');
+  if (!path) {
+    return null;
+  }
+  const virtual = path.startsWith('/') ? path : `/workspace/${path.replace(/^\.\//, '')}`;
+  const entry = projectStore.files[virtual];
+  const after = entry?.type === 'file' ? entry.content : null;
+  if (after === null && name !== 'project_write_file') {
+    return null;
+  }
+  const diff = lineDiff(before ?? '', after ?? String(args.content ?? ''));
+  return {
+    kind: 'change',
+    path,
+    action: before === null ? 'created' : 'updated',
+    added: diff.filter((line) => line.kind === 'add').length,
+    removed: diff.filter((line) => line.kind === 'remove').length,
+    diff: diff
+      .map((line) => `${line.kind === 'add' ? '+' : line.kind === 'remove' ? '-' : ' '}${line.text}`)
+      .join('\n')
+      .slice(0, 20_000),
+  };
+}
+
+/**
+ * A minimal line diff (longest-common-subsequence over lines), capped so a 4000-line
+ * file cannot stall the tab. bolt.diy renders diffs from `diff`/`diff-match-patch`;
+ * this needs no dependency because the only consumer is a monospace block.
+ */
+export function lineDiff(
+  before: string,
+  after: string,
+): Array<{ kind: 'add' | 'remove' | 'same'; text: string }> {
+  if (before === after) {
+    return [];
+  }
+  // `''.split('\n')` is `['']`; an empty file is zero lines, not one blank line.
+  const a = before === '' ? [] : before.split('\n');
+  const b = after === '' ? [] : after.split('\n');
+  const maxCells = 400_000;
+  if (a.length * b.length > maxCells) {
+    return [...a.map((text) => ({ kind: 'remove' as const, text })), ...b.map((text) => ({ kind: 'add' as const, text }))];
+  }
+  // LCS length table (bottom-up), then walk it to classify each line.
+  const table: Uint32Array[] = Array.from({ length: a.length + 1 }, () => new Uint32Array(b.length + 1));
+  for (let i = a.length - 1; i >= 0; i -= 1) {
+    for (let j = b.length - 1; j >= 0; j -= 1) {
+      table[i][j] =
+        a[i] === b[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+    }
+  }
+  const out: Array<{ kind: 'add' | 'remove' | 'same'; text: string }> = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      out.push({ kind: 'same', text: a[i] });
+      i += 1;
+      j += 1;
+    } else if (table[i + 1][j] >= table[i][j + 1]) {
+      out.push({ kind: 'remove', text: a[i] });
+      i += 1;
+    } else {
+      out.push({ kind: 'add', text: b[j] });
+      j += 1;
+    }
+  }
+  while (i < a.length) {
+    out.push({ kind: 'remove', text: a[i] });
+    i += 1;
+  }
+  while (j < b.length) {
+    out.push({ kind: 'add', text: b[j] });
+    j += 1;
+  }
+  // Collapse the long unchanged stretches: a diff is for seeing what changed.
+  const collapsed: typeof out = [];
+  let sameRun: Array<{ kind: 'same'; text: string }> = [];
+  const flushSame = () => {
+    if (sameRun.length > 6) {
+      collapsed.push(...sameRun.slice(0, 3));
+      collapsed.push({ kind: 'same', text: `… ${sameRun.length - 6} unchanged line(s) …` });
+      collapsed.push(...sameRun.slice(-3));
+    } else {
+      collapsed.push(...sameRun);
+    }
+    sameRun = [];
+  };
+  for (const line of out) {
+    if (line.kind === 'same') {
+      sameRun.push(line as { kind: 'same'; text: string });
+    } else {
+      flushSame();
+      collapsed.push(line);
+    }
+  }
+  flushSame();
+  return collapsed;
 }
 
 function requiresApproval(name: string): boolean {

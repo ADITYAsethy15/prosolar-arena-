@@ -1,0 +1,18 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+data/
+*.study_state.json
+continuous-study-state.json
+bun.lock
+bun.lockb
+
+
+# stale exports that look like the project but are not (v8: removed from the archive)
+*.zip
+!Prosolar--main.zip

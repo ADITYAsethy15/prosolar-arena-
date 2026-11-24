@@ -13,6 +13,37 @@
 export type RunMode = 'chat' | 'agent';
 
 const MODE_KEY = 'solara_run_mode';
+/**
+ * Tool calls per model response. Separate from the request budget above: this decides
+ * how many round trips a task costs, not how many it may spend. Persisted here so the
+ * panel and anything else that reads budgets agree on one number.
+ */
+export const BATCH_KEY = 'solara_agent_batch';
+export const MIN_BATCH = 1;
+export const MAX_BATCH = 16;
+export const DEFAULT_BATCH = 8;
+
+export function clampBatch(value: unknown): number {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_BATCH;
+  return Math.min(MAX_BATCH, Math.max(MIN_BATCH, n));
+}
+
+export function getBatch(): number {
+  const raw = read(BATCH_KEY);
+  return raw ? clampBatch(raw) : DEFAULT_BATCH;
+}
+
+export function saveBatch(value: unknown): number {
+  const n = clampBatch(value);
+  try {
+    localStorage.setItem(BATCH_KEY, String(n));
+  } catch {
+    // private mode: the value still applies for this task
+  }
+  publish();
+  return n;
+}
 export const ROUNDS_KEY = 'solara_agent_rounds';
 
 /**
@@ -98,7 +129,18 @@ export function subscribe(handler: Handler): () => void {
 
 // --- task bus: the composer hands a prompt to the panel, the panel hands the
 // answer back so it can join the chat transcript like any other reply.
-export type AgentResult = { text: string; roundsUsed: number; roundsAllowed: number };
+export type AgentResult = {
+  text: string;
+  roundsUsed: number;
+  roundsAllowed: number;
+  /** What the task actually cost, appended to the chat transcript next to the reply. */
+  upstreamCalls?: number;
+  toolCalls?: number;
+  totalTokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  reasoningTokens?: number;
+};
 
 const taskSubs = new Set<(text: string) => void>();
 export function onAgentTask(handler: (text: string) => void): () => void {

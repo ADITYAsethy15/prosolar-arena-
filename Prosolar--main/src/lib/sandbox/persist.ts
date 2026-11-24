@@ -94,6 +94,73 @@ export async function loadProject(): Promise<StoredProject | null> {
   });
 }
 
+/**
+ * The transcript, not just the files. bolt keeps a thread you can scroll back through;
+ * a reload that keeps the workspace but throws away the conversation makes the agent
+ * look amnesiac about work it just did. Keyed separately so a project reset can keep
+ * the thread, and capped hard because this store has no eviction of its own.
+ */
+const THREAD_ID = 'current-thread';
+const MAX_THREAD_EVENTS = 400;
+
+export type StoredThread = {
+  id: string;
+  events: Array<{ kind: string; at: number; data: unknown }>;
+  savedAt: number;
+};
+
+export async function saveThread(events: Array<{ kind: string; at: number; data: unknown }>): Promise<boolean> {
+  const db = await openDb();
+  if (!db) {
+    return false;
+  }
+  const trimmed = events.slice(-MAX_THREAD_EVENTS);
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put({ id: THREAD_ID, events: trimmed, savedAt: Date.now() } satisfies StoredThread);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+export async function loadThread(): Promise<StoredThread | null> {
+  const db = await openDb();
+  if (!db) {
+    return null;
+  }
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE, 'readonly');
+      const request = tx.objectStore(STORE).get(THREAD_ID);
+      request.onsuccess = () => resolve((request.result as StoredThread) ?? null);
+      request.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+export async function clearThread(): Promise<void> {
+  const db = await openDb();
+  if (!db) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).delete(THREAD_ID);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
 export async function clearProject(): Promise<void> {
   const db = await openDb();
   if (!db) {

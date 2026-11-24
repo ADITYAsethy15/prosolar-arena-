@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 import {
   Check,
+  Coins,
   Download,
   File as FileIcon,
   Folder,
@@ -36,22 +37,30 @@ import { bootWorkspace } from './bootstrap';
 import { projectStore } from './project';
 import { interactiveShell } from './terminal';
 import { runShell } from './runner';
-import { createAutoSaver, clearProject } from './persist';
+import { createAutoSaver, clearProject, clearThread, loadThread, saveThread } from './persist';
 import { closeProjectBridge } from './projectMcp';
 import { runAgentTask, setApprovalSink, type AgentEvent } from './loop';
 import {
+  clampBatch,
   clampRounds,
+  DEFAULT_BATCH,
   DEFAULT_ROUNDS,
+  getBatch,
   getRounds,
+  MAX_BATCH,
   MAX_ROUNDS,
+  MIN_BATCH,
   MIN_ROUNDS,
   onAgentTask,
   reportAgentResult,
+  saveBatch,
   saveRounds,
 } from './mode';
 
 const AUTO_KEY = 'solara_sandbox_autoapprove';
 const TOKENS_KEY = 'solara_sandbox_maxtokens';
+const THINKING_KEY = 'solara_sandbox_show_thinking';
+const PARALLEL_KEY = 'solara_sandbox_parallel_tools';
 // What one turn may spend on its answer. A `project_write_file` call carries the whole
 // file as a string inside the assistant message, so a 250-line component needs ~4k
 // tokens before it has written a word: at 2048 the JSON broke mid-call and the turn
@@ -78,6 +87,25 @@ export type SandboxPanelProps = {
 
 type Approval = { tool: string; detail: string; resolve: (ok: boolean) => void };
 
+type UsageTotals = {
+  toolCalls: number;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  reported: boolean;
+};
+
+type ChangeRecord = {
+  path: string;
+  action: 'created' | 'updated' | 'deleted' | 'unchanged';
+  added: number;
+  removed: number;
+  diff: string;
+  at: number;
+};
+
 export default function SandboxPanel({
   open,
   onClose,
@@ -95,6 +123,10 @@ export default function SandboxPanel({
   const [treeBusy, setTreeBusy] = useState(false);
   const [treeNote, setTreeNote] = useState('');
   const [viewing, setViewing] = useState<{ path: string; text: string; dirty: boolean } | null>(null);
+  // Latest diff per path. bolt.diy's file list badges what changed and the editor can show
+  // the patch itself; a diff that only exists in a scrolled-away log is not reviewable.
+  const [changes, setChanges] = useState<Record<string, ChangeRecord>>({});
+  const [showDiff, setShowDiff] = useState(true);
   const [prompt, setPrompt] = useState('');
   const [previews, setPreviews] = useState<PreviewInfo[]>([]);
   const [previewPort, setPreviewPort] = useState('5173');
@@ -109,14 +141,31 @@ export default function SandboxPanel({
     () => typeof localStorage !== 'undefined' && localStorage.getItem(AUTO_KEY) === '1',
   );
   const [rounds, setRounds] = useState<string>(() => String(getRounds()));
+  // Tool calls allowed in ONE model response. Raising this is what turns five rounds
+  // into one: the model writes every independent file in a single answer.
+  const [batch, setBatch] = useState<string>(() => String(getBatch()));
+  const [parallel, setParallel] = useState<boolean>(
+    () => typeof localStorage !== 'undefined' && localStorage.getItem(PARALLEL_KEY) !== '0',
+  );
+  /** Running cost of the current/last task, from the loop's `usage` events. */
+  const [usage, setUsage] = useState<UsageTotals | null>(null);
   const [running, setRunning] = useState(false);
+  // Streamed deltas are coalesced: one growing bubble, flushed on a frame. Emitting a
+  // React update per token is what makes a UI feel slower than a blocking call.
+  const [live, setLive] = useState<{ text: string; thinking: string }>({ text: '', thinking: '' });
+  const liveRef = useRef<{ text: string; thinking: string }>({ text: '', thinking: '' });
+  const liveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [issues, setIssues] = useState<string[]>([]);
   const [maxTokens, setMaxTokens] = useState<string>(() => String(clampTokens(localStorage.getItem(TOKENS_KEY))));
+  const [showThinking, setShowThinking] = useState<boolean>(
+    () => typeof localStorage !== 'undefined' && localStorage.getItem(THINKING_KEY) === '1',
+  );
 
   const termRef = useRef<{ write: (line: string) => void } | null>(null);
   const shellHostRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const treeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const changeCount = Object.keys(changes).length;
   const blocked = sandboxUnavailableReason();
   const toolsOk = providerSupportsTools(providerId);
 
@@ -153,7 +202,43 @@ export default function SandboxPanel({
 
   const log = useCallback(
     (event: AgentEvent) => {
-      setEvents((prev) => [...prev.slice(-160), event]);
+      if (event.kind === 'usage') {
+        setUsage(event);
+      }
+      if (event.kind === 'text') {
+        // The authoritative version of what was just streamed.
+        liveRef.current = { text: '', thinking: '' };
+        setLive({ text: '', thinking: '' });
+      }
+      if (event.kind !== 'stream' && event.kind !== 'thinking') {
+        setEvents((prev) => [...prev.slice(-160), event]);
+      }
+      if (event.kind === 'stream') {
+        liveRef.current = {
+          text: event.reset ? '' : liveRef.current.text + event.text,
+          thinking: event.reset ? '' : liveRef.current.thinking,
+        };
+        if (!liveTimer.current) {
+          liveTimer.current = setTimeout(() => {
+            liveTimer.current = null;
+            setLive({ ...liveRef.current });
+          }, 60);
+        }
+        return;
+      }
+      if (event.kind === 'thinking') {
+        liveRef.current = {
+          text: liveRef.current.text,
+          thinking: event.reset ? '' : (liveRef.current.thinking + event.text).slice(-4000),
+        };
+        if (!liveTimer.current) {
+          liveTimer.current = setTimeout(() => {
+            liveTimer.current = null;
+            setLive({ ...liveRef.current });
+          }, 120);
+        }
+        return;
+      }
       if (event.kind === 'tool') {
         termRef.current?.write(`\r\n\x1b[36m$\x1b[0m ${event.detail}`);
         if (treeTimer.current) {
@@ -166,6 +251,33 @@ export default function SandboxPanel({
         }, 400);
       } else if (event.kind === 'denied') {
         termRef.current?.write(`(rejected by user: ${event.detail})`);
+      } else if (event.kind === 'change') {
+        setChanges((prev) => {
+          const next = { ...prev };
+          if (event.action === 'unchanged' || (!event.added && !event.removed)) {
+            delete next[event.path];
+            return next;
+          }
+          next[event.path] = {
+            path: event.path,
+            action: event.action,
+            added: event.added,
+            removed: event.removed,
+            diff: event.diff,
+            at: Date.now(),
+          };
+          const keys = Object.keys(next);
+          if (keys.length > 60) {
+            keys
+              .sort((a, b) => next[a].at - next[b].at)
+              .slice(0, keys.length - 60)
+              .forEach((key) => delete next[key]);
+          }
+          return next;
+        });
+        termRef.current?.write(
+          `\x1b[90m${event.action} ${event.path} (+${event.added}/-${event.removed})\x1b[0m`,
+        );
       } else if (event.kind === 'error') {
         termRef.current?.write(`\x1b[31merror:\x1b[0m ${event.text}`);
       } else if (event.kind === 'gate') {
@@ -270,8 +382,16 @@ export default function SandboxPanel({
   }, [autoApprove]);
 
   useEffect(() => {
+    localStorage.setItem(PARALLEL_KEY, parallel ? '1' : '0');
+  }, [parallel]);
+
+  useEffect(() => {
     localStorage.setItem(TOKENS_KEY, String(clampTokens(maxTokens)));
   }, [maxTokens]);
+
+  useEffect(() => {
+    localStorage.setItem(THINKING_KEY, showThinking ? '1' : '0');
+  }, [showThinking]);
 
   // A turn kept running when its panel went away: the loop carried on spending
   // requests with no UI left to read the answer. Closing the panel stops it now.
@@ -283,6 +403,46 @@ export default function SandboxPanel({
   }, [open]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
+
+  // A reload should land on the same conversation, not an empty log next to a project
+  // full of work. Restore the last thread, and keep saving it as events arrive.
+  const threadReady = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const stored = await loadThread();
+      if (!cancelled && stored?.events?.length) {
+        setEvents(stored.events.map((entry) => entry.data as AgentEvent));
+        setChanges(
+          Object.fromEntries(
+            stored.events
+              .filter((entry) => (entry.data as AgentEvent).kind === 'change')
+              .map((entry) => {
+                const change = entry.data as Extract<AgentEvent, { kind: 'change' }>;
+                return [
+                  change.path,
+                  { ...change, at: entry.at } satisfies ChangeRecord,
+                ] as const;
+              }),
+          ),
+        );
+      }
+      threadReady.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!threadReady.current || events.length === 0) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      void saveThread(events.map((event) => ({ kind: event.kind, at: Date.now(), data: event })));
+    }, 1_000);
+    return () => clearTimeout(timer);
+  }, [events]);
 
   // --- terminal ------------------------------------------------------------
   useEffect(() => {
@@ -468,7 +628,21 @@ export default function SandboxPanel({
     if (String(budget) !== rounds) {
       setRounds(String(saveRounds(budget)));
     }
-    let stats = { roundsUsed: 0, roundsAllowed: budget, upstreamCalls: 0 };
+    const perRound = clampBatch(batch);
+    if (String(perRound) !== batch) {
+      setBatch(String(saveBatch(perRound)));
+    }
+    let stats = {
+      roundsUsed: 0,
+      roundsAllowed: budget,
+      upstreamCalls: 0,
+      toolCalls: 0,
+      totalTokens: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      reasoningTokens: 0,
+    };
+    setUsage(null);
     setRunning(true);
     setStatus('agent running…');
     const controller = new AbortController();
@@ -482,6 +656,9 @@ export default function SandboxPanel({
         model,
         maxTokens: clampTokens(maxTokens),
         maxRounds: budget,
+        maxToolCallsPerRound: clampBatch(batch),
+        parallelToolCalls: parallel,
+        showThinking,
         emit: log,
         onStats: (next) => {
           stats = next;
@@ -587,11 +764,13 @@ export default function SandboxPanel({
         await container.fs.rm(`/home/project/${name}`, { recursive: true, force: true });
       }
       await clearProject();
+      await clearThread();
       projectStore.bumpGeneration();
       await projectStore.refresh();
       await bootWorkspace();
       interactiveShell.dispose();
       setEvents([]);
+      setChanges({});
       setIssues([]);
       await refreshTree();
       setStatus('workspace reset');
@@ -771,6 +950,34 @@ export default function SandboxPanel({
                       </div>
                     </div>
                   )}
+                  {changeCount > 0 && (
+                    <div className="rounded-lg border border-zinc-800 bg-black/30 p-2">
+                      <p className="mb-1 text-[10px] uppercase tracking-wide text-zinc-500">
+                        {changeCount} file{changeCount === 1 ? '' : 's'} changed this session
+                      </p>
+                      <div className="flex flex-wrap gap-1">
+                        {Object.values(changes)
+                          .sort((a, b) => b.at - a.at)
+                          .map((change) => (
+                            <button
+                              key={change.path}
+                              type="button"
+                              onClick={() => {
+                                setTab('files');
+                                setShowDiff(true);
+                                void openFile(change.path);
+                              }}
+                              className="flex max-w-full items-center gap-1 rounded bg-zinc-900 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+                              title={`${change.action} · click to inspect the diff`}
+                            >
+                              <span className="truncate">{relPath(change.path)}</span>
+                              <span className="shrink-0 text-emerald-500">+{change.added}</span>
+                              <span className="shrink-0 text-rose-500">-{change.removed}</span>
+                            </button>
+                          ))}
+                      </div>
+                    </div>
+                  )}
                   {events.length === 0 && (
                     <p className="p-2 text-xs text-zinc-600">
                       No activity yet. Start with something concrete — &quot;scaffold a Vite + React counter app, then
@@ -781,6 +988,24 @@ export default function SandboxPanel({
                   {events.map((event, index) => (
                     <ActivityRow key={`${index}-${event.kind}`} event={event} />
                   ))}
+                  {(live.text || live.thinking) && (
+                    <div className="rounded-lg border border-cyan-800/40 bg-cyan-950/20 p-2">
+                      <p className="text-[10px] uppercase tracking-wide text-cyan-400">
+                        {live.text ? 'writing…' : 'thinking…'}
+                      </p>
+                      {live.thinking && !live.text && (
+                        <p className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-cyan-200/60">
+                          {live.thinking}
+                        </p>
+                      )}
+                      {live.text && (
+                        <p className="mt-1 whitespace-pre-wrap text-[11px] leading-relaxed text-zinc-200">
+                          {live.text}
+                          <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-cyan-400 align-middle" />
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -822,6 +1047,17 @@ export default function SandboxPanel({
                       <Trash2 className="h-3 w-3" /> reset
                     </button>
                   </div>
+                  {changeCount > 0 && (
+                    <label className="mb-2 flex cursor-pointer items-center gap-1.5 text-[10px] text-zinc-500">
+                      <input
+                        type="checkbox"
+                        className="accent-cyan-500"
+                        checked={showDiff}
+                        onChange={(event) => setShowDiff(event.target.checked)}
+                      />
+                      show diffs for {changeCount} changed file{changeCount === 1 ? '' : 's'}
+                    </label>
+                  )}
                   {treeNote && <p className="mb-1.5 font-mono text-[10px] text-zinc-600">{treeNote}</p>}
                   <ul className="space-y-0.5 font-mono text-[11px]">
                     {tree.map((entry) => {
@@ -843,6 +1079,12 @@ export default function SandboxPanel({
                             <span className={entry.dir ? 'truncate text-zinc-300' : 'truncate text-zinc-400'}>
                               {relPath(entry.path)}
                             </span>
+                            {!entry.dir && changes[entry.path] && (
+                              <span className="ml-1 shrink-0 font-mono text-[9px]">
+                                <span className="text-emerald-500">+{changes[entry.path].added}</span>
+                                <span className="text-rose-500">-{changes[entry.path].removed}</span>
+                              </span>
+                            )}
                             {locked && <Lock className="h-2.5 w-2.5 shrink-0 text-amber-400" />}
                           </button>
                           <button
@@ -872,6 +1114,24 @@ export default function SandboxPanel({
                       <div className="flex items-center gap-2 border-b border-zinc-800 px-2 py-1">
                         <span className="truncate font-mono text-[10px] text-zinc-500">{relPath(viewing.path)}</span>
                         {viewing.dirty && <span className="text-[9px] text-amber-400">unsaved</span>}
+                        {changes[viewing.path] && (
+                          <span className="font-mono text-[9px]">
+                            <span className="text-emerald-500">+{changes[viewing.path].added}</span>
+                            <span className="text-rose-500">-{changes[viewing.path].removed}</span>
+                          </span>
+                        )}
+                        {changes[viewing.path] && (
+                          <button
+                            type="button"
+                            onClick={() => setShowDiff((current) => !current)}
+                            className={`rounded px-1.5 py-0.5 text-[10px] ${
+                              showDiff ? 'bg-cyan-500/20 text-cyan-300' : 'bg-zinc-800 text-zinc-400'
+                            }`}
+                            title="Toggle between the file and the agent's diff for it"
+                          >
+                            diff
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => void saveViewing()}
@@ -888,12 +1148,16 @@ export default function SandboxPanel({
                           <X className="h-3 w-3" />
                         </button>
                       </div>
-                      <textarea
-                        value={viewing.text}
-                        onChange={(event) => setViewing({ ...viewing, text: event.target.value, dirty: true })}
-                        spellCheck={false}
-                        className="h-72 w-full resize-y bg-transparent p-2 font-mono text-[11px] text-zinc-300 focus:outline-none"
-                      />
+                      {showDiff && changes[viewing.path] ? (
+                        <DiffView diff={changes[viewing.path].diff} maxHeight="h-72" />
+                      ) : (
+                        <textarea
+                          value={viewing.text}
+                          onChange={(event) => setViewing({ ...viewing, text: event.target.value, dirty: true })}
+                          spellCheck={false}
+                          className="h-72 w-full resize-y bg-transparent p-2 font-mono text-[11px] text-zinc-300 focus:outline-none"
+                        />
+                      )}
                     </div>
                   )}
                 </div>
@@ -1080,7 +1344,7 @@ export default function SandboxPanel({
                   />
                 </label>
                 <label className="flex items-center gap-1 text-[10px] text-zinc-500">
-                  tool calls
+                  requests
                   <input
                     type="number"
                     min={MIN_ROUNDS}
@@ -1089,8 +1353,33 @@ export default function SandboxPanel({
                     onChange={(event) => setRounds(event.target.value.replace(/\D/g, ''))}
                     onBlur={() => setRounds(String(saveRounds(rounds)))}
                     className="w-10 rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 font-mono text-[10px] text-zinc-300"
-                    title={`How many tool calls the agent may make before it must answer (${MIN_ROUNDS}–${MAX_ROUNDS}, default ${DEFAULT_ROUNDS}). Each step is one request to your provider.`}
+                    title={`How many requests to your provider the task may spend (${MIN_ROUNDS}–${MAX_ROUNDS}, default ${DEFAULT_ROUNDS}). One request can carry several tool calls — see calls/request.`}
                   />
+                </label>
+                <label className="flex items-center gap-1 text-[10px] text-zinc-500">
+                  calls/request
+                  <input
+                    type="number"
+                    min={MIN_BATCH}
+                    max={MAX_BATCH}
+                    value={batch}
+                    onChange={(event) => setBatch(event.target.value.replace(/\D/g, ''))}
+                    onBlur={() => setBatch(String(saveBatch(batch)))}
+                    className="w-10 rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 font-mono text-[10px] text-zinc-300"
+                    title={`How many tool calls the model may return in ONE response (${MIN_BATCH}–${MAX_BATCH}, default ${DEFAULT_BATCH}). This is what makes 5 file writes cost 1 request instead of 5.`}
+                  />
+                </label>
+                <label
+                  className="flex cursor-pointer items-center gap-1 text-[10px] text-zinc-500"
+                  title="Ask the provider to return several tool calls per response (parallel_tool_calls). Off = one call per request. Some gateways reject the field and are retried without it automatically."
+                >
+                  <input
+                    type="checkbox"
+                    className="accent-cyan-500"
+                    checked={parallel}
+                    onChange={(event) => setParallel(event.target.checked)}
+                  />
+                  batch
                 </label>
                 <button
                   type="button"
@@ -1111,6 +1400,23 @@ export default function SandboxPanel({
                     <Square className="h-2.5 w-2.5" /> stop
                   </button>
                 )}
+                {usage && (
+                  <span
+                    className="flex items-center gap-1 rounded bg-zinc-900 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400"
+                    title={`${usage.promptTokens.toLocaleString()} prompt + ${usage.completionTokens.toLocaleString()} completion tokens${
+                      usage.reasoningTokens > 0 ? ` (of which ${usage.reasoningTokens.toLocaleString()} reasoning)` : ''
+                    } over ${usage.requests} request(s) and ${usage.toolCalls} tool call(s).${
+                      usage.reported ? '' : ' This provider did not report usage, so this is a floor.'
+                    }`}
+                  >
+                    <Coins className="h-2.5 w-2.5 text-cyan-500" />
+                    {usage.reported ? '' : '≥'}
+                    {usage.totalTokens.toLocaleString()} tok
+                    <span className="text-zinc-600">
+                      {usage.requests}r/{usage.toolCalls}c
+                    </span>
+                  </span>
+                )}
                 {status && <span className="truncate text-[11px] text-zinc-500">{status}</span>}
               </div>
             </footer>
@@ -1118,6 +1424,107 @@ export default function SandboxPanel({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Bolt renders markdown; a wall of raw punctuation after every round is the single
+ * clearest "this is not a real coding agent" tell. This is a deliberately small
+ * renderer — fenced code, inline code, bold — no HTML injection, no dependency.
+ */
+function AssistantText({ text }: { text: string }) {
+  const blocks = text.split(/```/);
+  return (
+    <div className="rounded-lg bg-zinc-900 p-2 text-[11px] leading-relaxed text-zinc-300">
+      {blocks.map((block, index) => {
+        if (index % 2 === 1) {
+          const newline = block.indexOf('\n');
+          const lang = newline === -1 ? block.trim() : block.slice(0, newline).trim();
+          const code = newline === -1 ? '' : block.slice(newline + 1).replace(/\n$/, '');
+          return (
+            <div key={index} className="my-1.5 overflow-hidden rounded border border-zinc-800">
+              <div className="flex items-center justify-between bg-zinc-950 px-2 py-0.5">
+                <span className="font-mono text-[9px] uppercase tracking-wide text-zinc-600">
+                  {lang || 'code'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void navigator.clipboard?.writeText(code)}
+                  className="text-[9px] text-zinc-600 hover:text-cyan-300"
+                >
+                  copy
+                </button>
+              </div>
+              <pre className="max-h-72 overflow-auto bg-[#07070a] p-2 font-mono text-[10px] text-zinc-300">
+                {code}
+              </pre>
+            </div>
+          );
+        }
+        return block
+          .split('\n')
+          .filter((line) => line.trim() !== '')
+          .map((line, lineIndex) => (
+            <p key={`${index}-${lineIndex}`} className="whitespace-pre-wrap">
+              {renderInline(line)}
+            </p>
+          ));
+      })}
+    </div>
+  );
+}
+
+/** `code`, **bold** and nothing else — the parts a coding agent's prose actually uses. */
+function renderInline(line: string) {
+  const parts = line.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
+      return (
+        <code key={index} className="rounded bg-zinc-800 px-1 font-mono text-[10px] text-cyan-300">
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return (
+        <strong key={index} className="text-zinc-100">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    return <span key={index}>{part}</span>;
+  });
+}
+
+/** Unified diff rendering, shared by the file viewer and the activity log. */
+function DiffView({ diff, maxHeight = 'h-72' }: { diff: string; maxHeight?: string }) {
+  const lines = diff ? diff.split('\n') : [];
+  if (lines.length === 0) {
+    return <p className="p-2 font-mono text-[10px] text-zinc-500">no textual diff</p>;
+  }
+  return (
+    <pre className={`${maxHeight} w-full overflow-auto bg-[#07070a] p-2 font-mono text-[10px] leading-relaxed`}>
+      {lines.map((line, index) => {
+        const isAdd = line.startsWith('+');
+        const isRemove = line.startsWith('-');
+        return (
+          <div
+            key={index}
+            className={
+              isAdd
+                ? 'bg-emerald-500/10 text-emerald-300'
+                : isRemove
+                  ? 'bg-rose-500/10 text-rose-300'
+                  : line.includes('unchanged line')
+                    ? 'italic text-zinc-600'
+                    : 'text-zinc-400'
+            }
+          >
+            {line || ' '}
+          </div>
+        );
+      })}
+    </pre>
   );
 }
 
@@ -1131,9 +1538,7 @@ function ActivityRow({ event }: { event: AgentEvent }) {
   }
   if (event.kind === 'text') {
     return (
-      <p className="whitespace-pre-wrap rounded-lg bg-zinc-900 p-2 text-[11px] leading-relaxed text-zinc-300">
-        {event.text}
-      </p>
+      <AssistantText text={event.text} />
     );
   }
   if (event.kind === 'error') {
@@ -1160,6 +1565,61 @@ function ActivityRow({ event }: { event: AgentEvent }) {
         {event.kind === 'denied' ? `rejected: ${event.detail}` : event.text}
       </p>
     );
+  }
+  if (event.kind === 'change') {
+    const tone =
+      event.action === 'created'
+        ? 'text-emerald-400'
+        : event.action === 'deleted'
+          ? 'text-rose-400'
+          : 'text-cyan-400';
+    return (
+      <details className="rounded-lg border border-zinc-800 bg-black/30">
+        <summary className="cursor-pointer list-none px-2 py-1.5 font-mono text-[11px]">
+          <span className="text-zinc-600">▸ </span>
+          <span className={tone}>{event.action}</span>{' '}
+          <span className="text-zinc-300">{event.path}</span>{' '}
+          <span className="text-emerald-500">+{event.added}</span>{' '}
+          <span className="text-rose-500">-{event.removed}</span>
+        </summary>
+        {event.diff ? (
+          <pre className="max-h-72 overflow-auto border-t border-zinc-800 bg-[#07070a] p-2 font-mono text-[10px] leading-relaxed">
+            {event.diff.split('\n').map((line, index) => {
+              const added = line.startsWith('+');
+              const removed = line.startsWith('-');
+              return (
+                <div
+                  key={index}
+                  className={added ? 'text-emerald-300' : removed ? 'text-rose-300' : 'text-zinc-500'}
+                >
+                  {line || ' '}
+                </div>
+              );
+            })}
+          </pre>
+        ) : (
+          <p className="border-t border-zinc-800 p-2 text-[10px] text-zinc-500">
+            {event.action === 'deleted' ? 'file removed' : 'no textual diff'}
+          </p>
+        )}
+      </details>
+    );
+  }
+  if (event.kind === 'usage') {
+    return (
+      <p className="px-2 font-mono text-[10px] text-zinc-600">
+        {event.reported ? '' : '≥ '}
+        {event.totalTokens.toLocaleString()} tokens ({event.promptTokens.toLocaleString()} in /{' '}
+        {event.completionTokens.toLocaleString()} out
+        {event.reasoningTokens > 0 ? `, ${event.reasoningTokens.toLocaleString()} reasoning` : ''}) ·{' '}
+        {event.requests} request{event.requests === 1 ? '' : 's'} · {event.toolCalls} tool call
+        {event.toolCalls === 1 ? '' : 's'}
+      </p>
+    );
+  }
+  if (event.kind === 'stream' || event.kind === 'thinking') {
+    // Rendered by the live bubble above the list; a row per token would be noise.
+    return null;
   }
   return (
     <details className="group rounded-lg border border-zinc-800 bg-black/30">
