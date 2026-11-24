@@ -30,6 +30,19 @@ export const MAX_AGENT_STEPS = 32;
 export const MAX_GATE_NUDGES = 2;
 
 /**
+ * Added to the prompt in single-shot mode. It rewrites the tool order the rest of the
+ * system prompt asks for, because the default order (plan, then edit, then run, then
+ * verify) cannot fit in one round.
+ */
+const SINGLE_SHOT_BRIEF = [
+  'SINGLE-SHOT MODE: you have ONE response to do the whole job. In that response, emit',
+  'agent_plan first, then every project_write_file / project_replace_lines needed, then the',
+  'first project_run_command, all as tool calls in the same response. Then, when asked,',
+  'answer in prose. Do not read files whose contents are already listed in the workspace',
+  'section, and do not poll anything you started — the harness reports process output back.',
+].join(' ');
+
+/**
  * Tool calls allowed in one model response. The ceiling is a guard-rail, not a
  * capability: one response carrying 16 writes is 16 approval prompts and a very long
  * single answer, and a model that batches badly runs out of `max_tokens` mid-call and
@@ -58,6 +71,8 @@ export type AgentEvent =
       promptTokens: number;
       completionTokens: number;
       reasoningTokens: number;
+      /** Prompt tokens served from the provider's prefix cache, when it reports them. */
+      cachedTokens: number;
       totalTokens: number;
       /** False when the provider sent no `usage` at all — the count is a floor, not a total. */
       reported: boolean;
@@ -361,7 +376,8 @@ const SYSTEM_PROMPT = [
   'Treat tool output as the source of truth. Report failed commands as failed and do not claim a file changed until a tool result confirms it.',
   'Keep runtime load light: do not run a production build unless asked, and only run install when package.json changed or node_modules is missing.',
   'Give brief progress updates in plain text between tool calls. Be concise: decide, then act.',
-  'BATCH YOUR TOOL CALLS. Every round costs the user one request, so emit as many independent calls as one response allows: all the files of a scaffold in one reply, then an install plus the reads you already know you need. Only split a step out when it depends on the result of the one before it (install before run, run before reading an error).',
+  'BATCH. One response = one request = one thing the user pays for. Put every independent call in the SAME response: all files of a scaffold together, then install, then run. Never spend a round on project_list_paths or on reading files whose contents are listed below — you have them. If a file is listed as truncated, read only that file.',
+  'For a NEW feature, write the code first and only then run it. If the workspace already has a page and an entry script, edit them in one batch; do not re-read them one at a time to decide.',
 ].join('\n');
 
 /**
@@ -370,7 +386,7 @@ const SYSTEM_PROMPT = [
  * panel labels the number "≥" when `reported` is false rather than showing a confident 0.
  */
 function accumulateUsage(
-  totals: { prompt: number; completion: number; reasoning: number; total: number },
+  totals: { prompt: number; completion: number; reasoning: number; total: number; cached: number },
   usage: ProviderTurnAnswer['usage'] | undefined,
 ): boolean {
   if (!usage || typeof usage !== 'object') {
@@ -378,17 +394,85 @@ function accumulateUsage(
   }
   const pick = (value: unknown) => (Number.isFinite(Number(value)) ? Math.max(0, Math.round(Number(value))) : 0);
   const prompt = pick(usage.prompt_tokens ?? (usage as Record<string, unknown>).input_tokens);
+  // Prefix-cache hits. Field names differ by gateway (OpenAI's prompt_tokens_details,
+  // DeepSeek's prompt_cache_hit_tokens, Anthropic's cache_read_input_tokens), and the
+  // number is the difference between "your per-round cost is flat" and "it triples".
+  const details = (usage.prompt_tokens_details ?? {}) as Record<string, unknown>;
+  const cachedRaw =
+    details.cached_tokens ??
+    (usage as Record<string, unknown>).prompt_cache_hit_tokens ??
+    (usage as Record<string, unknown>).cache_read_input_tokens;
+  const cached = pick(cachedRaw);
   const completion = pick(usage.completion_tokens ?? (usage as Record<string, unknown>).output_tokens);
   const reasoning = pick(usage.completion_tokens_details?.reasoning_tokens);
   const total = pick(usage.total_tokens) || prompt + completion;
   if (prompt + completion + total === 0) {
     return false;
   }
+  totals.cached += Math.min(cached, prompt);
   totals.prompt += prompt;
   totals.completion += completion;
   totals.reasoning += reasoning;
   totals.total += total;
   return true;
+}
+
+/**
+ * What is already in the workspace, as a stable text block for the system prompt.
+ *
+ * Two hard limits, both learned from real prompts: the block is capped in characters
+ * (a 60-file project must not triple every request's input tokens) and each file is
+ * capped in length (a listed 3 000-line file would be re-sent on every single round).
+ * Files over the per-file cap are listed with their line count and marked TRUNCATED so
+ * the model knows to read them properly instead of guessing from the head.
+ */
+const INVENTORY_MAX_CHARS = 24_000;
+const INVENTORY_MAX_FILE_CHARS = 4_000;
+
+export function workspaceInventory(): string {
+  let files: Record<string, { type?: string; content?: string; isBinary?: boolean } | undefined> = {};
+  try {
+    files = projectStore.files as never;
+  } catch {
+    return 'WORKSPACE: (unavailable)';
+  }
+  const paths = Object.keys(files)
+    .filter((path) => files[path]?.type === 'file')
+    .sort();
+  if (paths.length === 0) {
+    return 'WORKSPACE: empty. There is nothing to read — create the files you need.';
+  }
+  const lines: string[] = [`WORKSPACE (${paths.length} file${paths.length === 1 ? '' : 's'}), most of it below:`];
+  let used = 0;
+  const omitted: string[] = [];
+  for (const path of paths) {
+    const entry = files[path];
+    const display = path.replace(/^\/workspace\/?/, '');
+    if (!entry || entry.isBinary) {
+      lines.push(`- ${display} (binary)`);
+      continue;
+    }
+    const content = String(entry.content ?? '');
+    const lineCount = content === '' ? 0 : content.split('\n').length;
+    if (used > INVENTORY_MAX_CHARS) {
+      omitted.push(`${display} (${lineCount} lines)`);
+      continue;
+    }
+    let body = content;
+    let truncated = false;
+    if (body.length > INVENTORY_MAX_FILE_CHARS) {
+      body = body.slice(0, INVENTORY_MAX_FILE_CHARS);
+      truncated = true;
+    }
+    used += body.length;
+    lines.push(
+      `- ${display} (${lineCount} line${lineCount === 1 ? '' : 's'}${truncated ? `, TRUNCATED — read it with project_read_file` : ''}):\n${body}`,
+    );
+  }
+  if (omitted.length) {
+    lines.push(`Not shown (size budget): ${omitted.join(', ')}. Read these only if the task needs them.`);
+  }
+  return lines.join('\n');
 }
 
 export type RunOptions = {
@@ -407,6 +491,17 @@ export type RunOptions = {
    * any single answer may be), because those answer different questions.
    */
   maxToolCallsPerRound?: number;
+  /**
+   * Spend ONE tool-calling round on the whole job, then ask for the summary.
+   *
+   * Measured on a real 3-request budget: the agent spent round 1 on project_list_paths,
+   * round 2 reading package.json, round 3 reading main.js, and never wrote a file. Batching
+   * alone cannot fix that, because the ceiling that bites is the REQUEST budget, not the
+   * calls per request. In this mode the plan, every write and the first run go out in a
+   * single response; the loop then stops stepping and asks for prose. Verification is what
+   * is traded away, so the transcript says so instead of implying the gate ran.
+   */
+  singleShot?: boolean;
   /** Let the gateway batch calls in one response. Off = one call per round, always. */
   parallelToolCalls?: boolean;
   signal?: AbortSignal;
@@ -421,6 +516,7 @@ export type RunOptions = {
     promptTokens: number;
     completionTokens: number;
     reasoningTokens: number;
+    cachedTokens: number;
     totalTokens: number;
   }) => void;
 };
@@ -429,8 +525,17 @@ export type RunOptions = {
 export async function runAgentTask(options: RunOptions): Promise<string> {
   const rounds = clampRounds(options.maxRounds);
   const tools = toolDefinitions();
+  // The workspace inventory, written into the FIRST message. Round 1 used to burn a
+  // whole request on `project_list_paths` for information the harness already holds in
+  // `projectStore.files`, and — on a 3-request budget — that was a third of the task
+  // spent discovering a file list. A model that can already see the tree writes code
+  // instead of asking what is there.
+  const inventory = workspaceInventory();
   const messages: Array<Record<string, unknown>> = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    {
+      role: 'system',
+      content: `${SYSTEM_PROMPT}\n\n${options.singleShot ? `${SINGLE_SHOT_BRIEF}\n\n` : ''}${inventory}`,
+    },
     ...options.history.slice(-8).map((turn) => ({ role: turn.role, content: turn.content })),
     { role: 'user', content: options.prompt },
   ];
@@ -452,7 +557,7 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
   let stopped = false;
   // Token accounting, summed from each turn's `usage`. Nothing else in the app knows
   // what a task cost, and on a metered key that is the number people actually want.
-  const tokens = { prompt: 0, completion: 0, reasoning: 0, total: 0 };
+  const tokens = { prompt: 0, completion: 0, reasoning: 0, total: 0, cached: 0 };
   let toolCallsRun = 0;
   const batchSize = clampBatch(options.maxToolCallsPerRound);
   /** Did any turn actually report usage? If not the counter understates, and says so. */
@@ -465,6 +570,7 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
       promptTokens: tokens.prompt,
       completionTokens: tokens.completion,
       reasoningTokens: tokens.reasoning,
+      cachedTokens: tokens.cached,
       totalTokens: tokens.total,
       reported: usageReported,
     });
@@ -472,9 +578,9 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
   options.emit({
     kind: 'log',
     text:
-      `budget: ${rounds} model request(s), up to ${batchSize} tool call(s) per request, ` +
-      `${(options.maxTokens ?? 8192).toLocaleString()} tokens per answer — plus at most ` +
-      `${MAX_GATE_NUDGES} gate nudge(s) and 1 summary request`,
+      `budget: ${rounds} model request(s)${options.singleShot ? ' (single-shot: one tool round, then a summary)' : ''}, ` +
+      `up to ${batchSize} tool call(s) per request, ${(options.maxTokens ?? 8192).toLocaleString()} tokens per answer` +
+      `${options.singleShot ? '' : ` — plus at most ${MAX_GATE_NUDGES} gate nudge(s) and 1 summary request`}`,
   });
 
   for (let round = 1; round <= rounds; round++) {
@@ -699,6 +805,26 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
     }
 
     const progress = getProgress(calls, options.prompt, toolRounds, denied);
+
+    if (options.singleShot) {
+      // The one tool round is spent. Ask for the summary, and say plainly what was NOT
+      // verified — the alternative is a transcript that looks gated when it was not.
+      const problems = completionProblems(progress);
+      if (problems.length > 0) {
+        options.emit({ kind: 'gate', problems, next: 'summarize honestly' });
+      }
+      if (round < rounds) {
+        messages.push({
+          role: 'user',
+          content:
+            'Single-shot round complete. Reply now in prose — no tool calls — with what you wrote, what you ran, and what you did NOT verify. Be specific and short.',
+        });
+        gateSummaryPending = true;
+        continue;
+      }
+      break;
+    }
+
     if (progress.status === 'ready') {
       options.emit({ kind: 'log', text: 'completion gate accepted the task' });
       // One more request for the summary the user actually reads. Breaking here used
@@ -738,6 +864,7 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
     promptTokens: tokens.prompt,
     completionTokens: tokens.completion,
     reasoningTokens: tokens.reasoning,
+    cachedTokens: tokens.cached,
     totalTokens: tokens.total,
   });
   return finalText;

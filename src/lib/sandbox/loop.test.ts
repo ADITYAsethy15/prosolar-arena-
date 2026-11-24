@@ -68,7 +68,11 @@ vi.mock('./container', () => ({
 vi.mock('./project', () => ({
   projectStore: {
     generation: 1,
-    files: {},
+    // The inventory block reads this, so the test asserts on real content.
+    files: {
+      '/workspace/index.html': { type: 'file', content: '<html>shell</html>', isBinary: false },
+      '/workspace/main.js': { type: 'file', content: '// entry', isBinary: false },
+    },
     requestTerminal: () => undefined,
     writeToTerminal: () => undefined,
     ensureLoaded: async () => undefined,
@@ -388,5 +392,98 @@ describe('token accounting', () => {
     expect(clampBatch(999)).toBe(MAX_BATCH);
     expect(clampBatch(-4)).toBe(DEFAULT_BATCH);
     expect(MIN_BATCH).toBe(1);
+  });
+});
+
+describe('the "reads files one by one and never writes" failure', () => {
+  beforeEach(() => {
+    script.length = 0;
+    sentMessages.length = 0;
+    executed.length = 0;
+    executable = new Set([
+      'project_list_paths',
+      'project_read_file',
+      'project_write_file',
+      'project_run_command',
+      'agent_plan',
+    ]);
+  });
+
+  it('shows the workspace in the system prompt so round 1 does not need a request', async () => {
+    script.push({ content: 'ok' });
+    await run({ maxRounds: 2 });
+    const system = String(sentMessages[0][0].content);
+    expect(system).toContain('WORKSPACE');
+    expect(system).toContain('index.html');
+    expect(system).toContain('main.js');
+    // And the batching rule that tells the model not to spend a round listing files.
+    expect(system).toMatch(/Never spend a round on project_list_paths/);
+  });
+
+  it('single-shot does the whole job in ONE tool round, then summarises', async () => {
+    script.push(
+      {
+        tool_calls: [
+          call('agent_plan', {
+            goal: 'a three.js earth',
+            steps: ['write index.html', 'write main.js', 'run the dev server'],
+            criteria: [{ id: 'c1', description: 'earth renders' }],
+            requiresPreview: false,
+          }),
+          call('project_write_file', { path: 'index.html', content: '<script type="module" src="main.js"></script>' }),
+          call('project_write_file', { path: 'main.js', content: 'import * as THREE from "three";' }),
+          call('project_run_command', { command: 'npm run dev', purpose: 'run' }),
+        ],
+      },
+      { content: 'Wrote index.html and main.js; started the dev server; did not verify rendering.' },
+    );
+
+    const { text, events } = await run({ maxRounds: 3, singleShot: true });
+
+    // One request did all the work, a second wrote the summary. No reconnaissance round.
+    // agent_plan is executed by the harness itself, so the MCP spy sees the three
+    // project calls — all of them, in one round, in the order the model asked.
+    expect(executed.map((entry) => entry.name)).toEqual([
+      'project_write_file',
+      'project_write_file',
+      'project_run_command',
+    ]);
+    expect(sentMessages).toHaveLength(2);
+    expect(text).toContain('did not verify');
+    expect(String(sentMessages[0][0].content)).toContain('SINGLE-SHOT MODE');
+    // The budget line must not promise nudges that single-shot will not spend.
+    expect(events.some((event) => event.kind === 'log' && String(event.text).includes('single-shot'))).toBe(true);
+  });
+
+  it('single-shot never issues a second tool round, even when work is unfinished', async () => {
+    script.push(
+      { tool_calls: [call('project_write_file', { path: 'a.txt', content: 'a' })] },
+      { content: 'Only one file written; nothing was run.' },
+    );
+    const { events } = await run({ maxRounds: 3, singleShot: true });
+    const toolRounds = events.filter((event) => event.kind === 'round').length;
+    expect(toolRounds).toBeLessThanOrEqual(2);
+    expect(executed.filter((entry) => entry.name === 'project_write_file')).toHaveLength(1);
+    // It says what was not verified rather than claiming the gate passed.
+    expect(events.some((event) => event.kind === 'gate')).toBe(true);
+  });
+
+  it('counts prefix-cache hits separately from fresh prompt tokens', async () => {
+    script.push({
+      content: 'done',
+      usage: {
+        prompt_tokens: 1000,
+        completion_tokens: 20,
+        total_tokens: 1020,
+        prompt_tokens_details: { cached_tokens: 960 },
+      },
+    });
+    const { events } = await run({ maxRounds: 1 });
+    const usage = events.filter((event) => event.kind === 'usage').pop() as unknown as {
+      promptTokens: number;
+      cachedTokens: number;
+    };
+    expect(usage.promptTokens).toBe(1000);
+    expect(usage.cachedTokens).toBe(960);
   });
 });

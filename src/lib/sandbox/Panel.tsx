@@ -51,6 +51,7 @@ import {
   MAX_ROUNDS,
   MIN_BATCH,
   MIN_ROUNDS,
+  SINGLE_SHOT_BELOW,
   onAgentTask,
   reportAgentResult,
   saveBatch,
@@ -61,6 +62,7 @@ const AUTO_KEY = 'solara_sandbox_autoapprove';
 const TOKENS_KEY = 'solara_sandbox_maxtokens';
 const THINKING_KEY = 'solara_sandbox_show_thinking';
 const PARALLEL_KEY = 'solara_sandbox_parallel_tools';
+const SINGLE_SHOT_KEY = 'solara_sandbox_single_shot';
 // What one turn may spend on its answer. A `project_write_file` call carries the whole
 // file as a string inside the assistant message, so a 250-line component needs ~4k
 // tokens before it has written a word: at 2048 the JSON broke mid-call and the turn
@@ -93,6 +95,7 @@ type UsageTotals = {
   promptTokens: number;
   completionTokens: number;
   reasoningTokens: number;
+  cachedTokens: number;
   totalTokens: number;
   reported: boolean;
 };
@@ -147,6 +150,14 @@ export default function SandboxPanel({
   const [parallel, setParallel] = useState<boolean>(
     () => typeof localStorage !== 'undefined' && localStorage.getItem(PARALLEL_KEY) !== '0',
   );
+  /**
+   * null = automatic (single-shot whenever the request budget is below
+   * SINGLE_SHOT_BELOW). true/false = the user decided.
+   */
+  const [singleShot, setSingleShot] = useState<boolean | null>(() => {
+    const stored = typeof localStorage === 'undefined' ? null : localStorage.getItem(SINGLE_SHOT_KEY);
+    return stored === '1' ? true : stored === '0' ? false : null;
+  });
   /** Running cost of the current/last task, from the loop's `usage` events. */
   const [usage, setUsage] = useState<UsageTotals | null>(null);
   const [running, setRunning] = useState(false);
@@ -166,6 +177,7 @@ export default function SandboxPanel({
   const abortRef = useRef<AbortController | null>(null);
   const treeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const changeCount = Object.keys(changes).length;
+  const singleShotEffective = singleShot ?? clampRounds(rounds) < SINGLE_SHOT_BELOW;
   const blocked = sandboxUnavailableReason();
   const toolsOk = providerSupportsTools(providerId);
 
@@ -384,6 +396,14 @@ export default function SandboxPanel({
   useEffect(() => {
     localStorage.setItem(PARALLEL_KEY, parallel ? '1' : '0');
   }, [parallel]);
+
+  useEffect(() => {
+    if (singleShot === null) {
+      localStorage.removeItem(SINGLE_SHOT_KEY);
+    } else {
+      localStorage.setItem(SINGLE_SHOT_KEY, singleShot ? '1' : '0');
+    }
+  }, [singleShot]);
 
   useEffect(() => {
     localStorage.setItem(TOKENS_KEY, String(clampTokens(maxTokens)));
@@ -641,6 +661,7 @@ export default function SandboxPanel({
       promptTokens: 0,
       completionTokens: 0,
       reasoningTokens: 0,
+      cachedTokens: 0,
     };
     setUsage(null);
     setRunning(true);
@@ -658,6 +679,7 @@ export default function SandboxPanel({
         maxRounds: budget,
         maxToolCallsPerRound: clampBatch(batch),
         parallelToolCalls: parallel,
+        singleShot: singleShot ?? budget < SINGLE_SHOT_BELOW,
         showThinking,
         emit: log,
         onStats: (next) => {
@@ -1381,6 +1403,28 @@ export default function SandboxPanel({
                   />
                   batch
                 </label>
+                <label
+                  className={`flex cursor-pointer items-center gap-1 text-[10px] ${
+                    singleShotEffective ? 'text-amber-300' : 'text-zinc-500'
+                  }`}
+                  title={
+                    singleShot === null
+                      ? `Auto: single-shot whenever the request budget is below ${SINGLE_SHOT_BELOW}. In single-shot the whole job (plan + writes + first run) goes out in ONE response, then a summary — the default look-around-first order cannot fit in a tiny budget. Click to pin it on or off.`
+                      : singleShot
+                        ? 'Pinned ON: one tool round, then a summary. Verification is skipped, and the transcript says so.'
+                        : 'Pinned OFF: the full plan → edit → run → verify gate runs, which needs at least 4 requests.'
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    className="accent-amber-500"
+                    checked={singleShotEffective}
+                    onChange={() => setSingleShot(singleShotEffective ? false : true)}
+                    onDoubleClick={() => setSingleShot(null)}
+                  />
+                  single-shot
+                  {singleShot === null && <span className="text-zinc-600">auto</span>}
+                </label>
                 <button
                   type="button"
                   disabled={running || !prompt.trim() || !apiKey || !model || !baseUrl || !toolsOk}
@@ -1609,7 +1653,8 @@ function ActivityRow({ event }: { event: AgentEvent }) {
     return (
       <p className="px-2 font-mono text-[10px] text-zinc-600">
         {event.reported ? '' : '≥ '}
-        {event.totalTokens.toLocaleString()} tokens ({event.promptTokens.toLocaleString()} in /{' '}
+        {event.totalTokens.toLocaleString()} tokens ({event.promptTokens.toLocaleString()} in
+        {event.cachedTokens > 0 ? `, ${event.cachedTokens.toLocaleString()} cached` : ''} /{' '}
         {event.completionTokens.toLocaleString()} out
         {event.reasoningTokens > 0 ? `, ${event.reasoningTokens.toLocaleString()} reasoning` : ''}) ·{' '}
         {event.requests} request{event.requests === 1 ? '' : 's'} · {event.toolCalls} tool call

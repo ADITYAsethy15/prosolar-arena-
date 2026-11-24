@@ -64,6 +64,14 @@ export const MIN_ROUNDS = 1;
 export const MAX_ROUNDS = 60;
 export const DEFAULT_ROUNDS = 24;
 
+/**
+ * Below this many requests the default plan -> edit -> run -> verify order cannot fit:
+ * it needs at least one round to look around, one to write, one to run and one to
+ * verify, and that is before any repair. Under it, the loop runs single-shot (one tool
+ * round, then the summary) instead of spending the whole budget on reconnaissance.
+ */
+export const SINGLE_SHOT_BELOW = 4;
+
 export function clampRounds(value: unknown): number {
   const n = Math.round(Number(value));
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_ROUNDS;

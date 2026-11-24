@@ -223,3 +223,52 @@ no `usage` at all (some proxies drop it in stream mode) and the panel prints `�
 of a confident number. The chat footer reports **requests and tool calls separately** —
 the old footer labelled the request count "tool calls", which made a correctly batched
 turn look wrong.
+
+---
+
+## Why the agent reads files one at a time, and what was done about it (v12)
+
+The reported session, verbatim, on a 3-request budget:
+
+```
+round 1  · 1 request · 0 tool calls   project_list_paths: .
+round 2  · 2 requests · 1 tool call   project_read_file: package.json
+round 3  · 3 requests · 2 tool calls  project_read_file: main.js
+→ budget gone. No file written, no three.js, no answer.
+```
+
+Nothing in that run is a model bug in isolation; it is the default tool ORDER colliding
+with a tiny request budget. The system prompt asked for plan → read what you need →
+edit → run → verify, and each arrow that needs a result costs a request. Three fixes,
+each targeting a different part of it:
+
+1. **The workspace is in the first message.** `workspaceInventory()` renders
+   `projectStore.files` into the system prompt (24 000-character block budget, 4 000
+   characters per file, longer files listed with their line count and marked
+   `TRUNCATED — read it`). `project_list_paths` is now redundant for the common case, and
+   the prompt says so: *"Never spend a round on project_list_paths."*
+2. **Single-shot mode.** `singleShot` puts `agent_plan` + every write + the first run in
+   ONE response, then spends one more request on the prose summary. It is **automatic
+   when the request budget is below 4** (`SINGLE_SHOT_BELOW`) and pinned from the composer
+   ("single-shot auto/on/off"). Verification is what it trades away, so the transcript
+   says exactly that: the gate line reports unmet criteria and the summary is asked for
+   "what you did NOT verify". A run that looks gated when it was not is worse than one
+   that admits it.
+3. **Prefix-cache visibility.** Per-round input tokens were 3 457 → 7 028 → 10 847 and
+   the *delta* never got cheaper, which is what a cache miss looks like. `usage` parsing
+   now reads `prompt_tokens_details.cached_tokens` (also `prompt_cache_hit_tokens`,
+   `cache_read_input_tokens`) and the usage line prints "in, cached / out". If cached
+   stays 0 across rounds, the gateway is not caching — requests are immutable and only
+   the leading system block is shared, so a gateway that caches only exact prefixes will
+   never hit, and the only lever left is fewer, larger requests.
+
+**The arithmetic that matters.** On a 3-request budget the three modes cost:
+
+| Mode | Requests | What you get |
+| --- | --- | --- |
+| default gate | 4+ (plan, write, run, verify) | verified work — but does not fit |
+| single-shot | 2 | files + first run + honest summary |
+| single-shot, 1 request | 1 | files, no run, no summary |
+
+That is why the budget line in the activity log now names the mode: the old text promised
+"2 gate nudges and 1 summary request" that a single-shot run never spends.

@@ -76,6 +76,12 @@ map and the reasoning behind each piece.
   the panel coalesces deltas into one growing bubble on a 60 ms timer instead of re-rendering per token. Any
   stream failure falls back to the blocking `/api/sandbox/turn` path silently, so a provider that cannot
   stream still works.
+- **It does not waste requests looking around.** The workspace inventory (paths, sizes,
+  file contents up to a budget) is written into the first message, so round 1 writes code
+  instead of asking for a directory listing. When the request budget is small, the panel
+  switches to **single-shot** automatically: plan + every write + the first run in one
+  response, then one request for the summary — and the transcript states plainly what was
+  not verified.
 - **One request can carry several tool calls.** The model is told to batch independent
   work, `parallel_tool_calls` is sent upstream (and dropped with a visible note if a
   gateway rejects the field), and the loop runs every call in a single response up to a
