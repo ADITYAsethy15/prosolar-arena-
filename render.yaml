@@ -1,3 +1,7 @@
+# Repo-root blueprint. The app IS the repository root in this layout, so no
+# rootDir is needed: Render's working directory and this file agree.
+# (If you instead push the archive layout, where everything sits under
+# Prosolar--main/, add `rootDir: Prosolar--main` to the service below.)
 services:
   - type: web
     name: solara

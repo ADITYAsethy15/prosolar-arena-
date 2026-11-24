@@ -95,12 +95,47 @@ If you only want to hand someone the project, the archive contains everything ex
 `node_modules` and `dist` and is reproducible with:
 
 ```bash
+# Render-ready layout: the app IS the archive root.
+(cd Prosolar--main && zip -qr ../prosolar-sandbox-render.zip . \
+  -x "node_modules/*" -x "dist/*" -x ".git/*")
+# Archive layout (what earlier deliveries used): app under Prosolar--main/.
 zip -qr prosolar-sandbox-bolt.zip Prosolar--main \
   -x "Prosolar--main/node_modules/*" -x "Prosolar--main/dist/*"
 ```
 
-This build ships as `prosolar-sandbox-bolt.zip` (~2.4 MB, 71 files, no `node_modules`,
-no `dist`). evapfile URLs are content-addressed, so the hash **in the URL** is the
+## The Render build that fails with `ENOENT ... /opt/render/project/src/package.json`
+
+That error is not about Node, npm or the lockfile: the build ran `npm install` in the
+**repo root** and there was no `package.json` there, because the app lived in
+`Prosolar--main/`. Three ways out, in order of preference:
+
+1. **Push a repo whose root is the app** (what `prosolar-sandbox-render.zip` below is).
+   Nothing to configure: `npm install && npm run build` and `npm start` are already
+   correct, and `render.yaml` in that root matches.
+2. **Keep the current repo layout** and set Render's **Root Directory** to
+   `Prosolar--main` (Settings → Root Directory), or add `rootDir: Prosolar--main` to the
+   service in `render.yaml`. Build command and start command stay as they are.
+3. **Use the blueprint**: `render.yaml` at the repo root with `rootDir:` set, New →
+   Blueprint, pick the repo.
+
+Two details that bite after the path is fixed:
+
+- **Start command must be `npm start`, not `node server.js`.** The server is TypeScript
+  run through `tsx`; `dist/` is the Vite client bundle only, and `express.static` serves
+  it from `process.cwd()/dist`.
+- **Node 22 is required**, not preferred: `undici@8` throws
+  `Cannot read properties of undefined (reading 'bind')` on Node 20 at import time, so a
+  successful build followed by an instant crash is this, not the app. `.node-version` and
+  `engines` both say 22; a Render `NODE_VERSION` env var should be `22.20.0` or omitted
+  in favour of those.
+
+`npm ci` also runs `node scripts/sync-workspace.mjs`, a no-op unless a `Prosolar--main/`
+folder exists next to the root `package.json` — it keeps an archive-style checkout from
+deploying stale code.
+
+This build ships in two layouts: `prosolar-sandbox-render.zip` (app at the archive root,
+for Render and any other git-push host) and `prosolar-sandbox-bolt.zip` (same code under
+`Prosolar--main/`). Both are ~2.4 MB, ~72 files, no `node_modules`, no `dist`. evapfile URLs are content-addressed, so the hash **in the URL** is the
 sha-256 of the archive — a download is verified by hashing it and comparing to that.
 (The hash is deliberately not written into this file: any edit here changes the
 archive's checksum, so a literal would be stale the moment it was saved.)
@@ -108,7 +143,7 @@ archive's checksum, so a literal would be stale the moment it was saved.)
 Verify a download with
 `curl -s https://evapfile.space/<hash>.zip | sha256sum` — evapfile addresses files by
 their sha-256, so the hash in the URL is the checksum. This archive was unpacked in a
-clean directory and re-verified: `npm ci` (357 packages) → `npx vitest run` (29/29) →
+clean directory and re-verified: `npm ci` (357 packages) → `npx vitest run` (35/35) →
 `npm run build` (`dist/rg.wasm` present) → `npm start` → `/healthz` `{"ok":true}` →
 unlock → `/api/sandbox/stream` returned a full SSE turn (reasoning, text, tool_delta,
 done with usage).
