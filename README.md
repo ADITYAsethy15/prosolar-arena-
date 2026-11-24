@@ -57,7 +57,9 @@ map and the reasoning behind each piece.
   (`project_read_file`, `project_list_paths`, `project_search_content`, `project_find_related_files`), writes
   (`project_write_file`, `project_replace_lines`, `project_patch_file`, `project_create_directory`,
   `project_delete_path`), processes (`project_run_command`, `project_get_process_output`, `project_stop_process`),
-  and research (`web_search`, `web_fetch`, relayed through this app's server).
+  and research (`web_search`, `web_fetch`, relayed through this app's server), plus the two gate tools
+  (`agent_plan`, `agent_complete`). The Activity tab lists this surface under **"N tools available"**, generated
+  from the same definitions the provider is given, so what you see cannot drift from what is callable.
 - **Writes are validated before they are saved.** A `.ts`/`.tsx`/`.js` file is parsed with Prettier's own parser
   first; a syntax error comes back to the model with the line and a hint instead of a bundler error three rounds
   later. Edits go through line-range patches guarded by a SHA-256 revision, so a stale patch is a hard conflict

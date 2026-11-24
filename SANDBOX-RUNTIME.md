@@ -111,6 +111,30 @@ lives in the harness, not in the model's willingness to follow a long prompt.
   `refresh()`, so a file written by `sh` or by an import is visible to the tools
   after a refresh instead of being invisible forever.
 
+## Post-mortem: the run where the gate could never be satisfied
+
+A real session produced five runs in a row whose only output was "no final answer",
+one of them ending with `agent_complete` rejected as `Unknown project tool`. The
+agent was told by the gate to call a tool the harness refused to execute, so every
+run was unwinnable. Six defects, all now covered by tests:
+
+| # | defect | fix |
+| --- | --- | --- |
+| 1 | `parseToolArguments` validated only `projectToolDefinitions`, so `agent_plan` / `agent_complete` failed as unknown tools while the provider had been told they exist. | The agent tools are declared beside the project tools (`AGENT_TOOL_DEFINITIONS`), and `allToolDefsForProvider()` is the single source for the provider `tools[]`, the validator and the dispatcher. A test asserts advertised ≡ executable. |
+| 2 | A turn that called tools and carried reasoning but no prose logged `no final answer; last reasoning: …` — on *every* working round. | That line is only emitted when the model also failed to call a tool. |
+| 3 | `agent_complete` accepted the task, then the loop `break`ed before the model could write its summary, leaving an empty chat reply after successful work. | The loop spends one extra request on the summary and treats that prose as the answer. |
+| 4 | Gate nudges incremented `stepCount` and could be issued on the final round, so the budget line and the reported cost were both wrong. | Nudges are capped (`MAX_GATE_NUDGES`) and never issued without a round left to act on; `stepCount` counts model requests, `toolRounds` counts tool-calling rounds. |
+| 5 | A reasoning model spending 30k reasoning tokens and returning nothing was reported as one generic "turn not completed". | `reasoningOnly()` detects it, one corrective request is sent with an explicit "call a tool or answer" instruction, and a second occurrence stops with advice to *lower* max tokens. |
+| 6 | Preview exceptions survive a project reset and were fed to the new project's first round, sending the agent after a file that no longer exists. | `bumpGeneration()` clears the preview-issue queue. |
+
+Two UI consequences of the same session: the Activity tab now opens with a
+**"N tools available"** panel listing every callable tool grouped by purpose (derived
+from the same definitions, so it cannot drift), and reported preview errors get
+**dismiss** and **ask the agent to fix** buttons instead of accumulating forever.
+
+`loop.test.ts` drives the real loop with a scripted provider and asserts on what the
+model was *told*, which is the seam all six defects lived in.
+
 ## Verifying it
 
 ```bash

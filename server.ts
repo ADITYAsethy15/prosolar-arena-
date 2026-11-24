@@ -892,6 +892,9 @@ app.post('/api/sandbox/turn', async (req, res) => {
           : {}),
       },
       ...(reasoningContent ? { reasoningContent: reasoningContent.slice(0, 20_000) } : {}),
+      // Passed through so the agent loop can tell "the model deliberated and never
+      // answered" (completion tokens ~0, reasoning tokens large) from "the answer was
+      // cut off". Without this the panel said only "no final answer".
       usage: json?.usage ?? null,
       finishReason: choice?.finish_reason ?? null,
     });

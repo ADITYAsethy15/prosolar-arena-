@@ -13,6 +13,7 @@
 // Everything still round-trips through the container filesystem: the map is a
 // cache, not the source of truth. `refresh()` rebuilds it from disk.
 // ============================================================================
+import { clearPreviewIssues } from './container';
 import {
   getContainer,
   listTree,
@@ -100,6 +101,10 @@ class ProjectStore {
    */
   bumpGeneration(): number {
     this.#generation += 1;
+    // Preview issues are per project: a `uTime` crash from the project the user just
+    // replaced is not evidence about the new one. Feeding it to the fresh project's
+    // first round sent the agent hunting a file that does not exist any more.
+    clearPreviewIssues();
     this.#emit();
     return this.#generation;
   }

@@ -184,11 +184,91 @@ export function toolDefsForProvider(): Array<{
   });
 }
 
+/**
+ * Tools the agent loop implements itself rather than executing in the project.
+ * They are declared here so there is ONE list of everything the model can call:
+ * the provider `tools[]`, the argument validator and the MCP bridge all read it.
+ *
+ * Regression this fixes: the loop used to validate every call against
+ * `projectToolDefinitions` only, so `agent_plan` and `agent_complete` were answered
+ * with "Unknown project tool" and the completion gate became unsatisfiable — the
+ * agent was told by the gate to call a tool the harness itself rejected.
+ */
+export const AGENT_TOOL_DEFINITIONS = {
+  agent_plan: {
+    description:
+      'Record a concise task plan with observable completion criteria BEFORE editing or running anything. Each criterion has an id and a description. Use unique, stable ids. Set requiresPreview true for a web app, and preserve the existing project on follow-up requests.',
+    inputSchema: z.strictObject({
+      goal: z.string().min(1).max(500),
+      steps: z.array(z.string().min(1).max(250)).min(1).max(6),
+      criteria: z
+        .array(
+          z.strictObject({
+            id: z.string().min(1).max(40),
+            description: z.string().min(1).max(400),
+          }),
+        )
+        .min(1)
+        .max(8),
+      requiresPreview: z.boolean(),
+    }),
+  },
+  agent_complete: {
+    description:
+      'Finish the current task only after running it and passing relevant checks after the latest edit. Report every planned criterion by its exact id. Evidence from successful project tool calls is attached automatically — do not invent evidence ids. Use outcome "blocked" with a concrete reason if completion is impossible.',
+    inputSchema: z.strictObject({
+      outcome: z.enum(['complete', 'blocked']),
+      summary: z.string().min(1).max(1000),
+      criteria: z
+        .array(
+          z.strictObject({
+            id: z.string().min(1).max(40),
+            evidence: z.array(z.string().min(1).max(256)).max(20).optional(),
+          }),
+        )
+        .max(8)
+        .optional(),
+    }),
+  },
+} as const;
+
+export type AgentToolName = keyof typeof AGENT_TOOL_DEFINITIONS;
+
+export const AGENT_TOOL_NAMES = Object.keys(AGENT_TOOL_DEFINITIONS) as AgentToolName[];
+
+export function isAgentTool(name: string): name is AgentToolName {
+  return name in AGENT_TOOL_DEFINITIONS;
+}
+
+/** Every tool the model is shown, project tools included. */
+export function allToolDefsForProvider(): Array<{
+  type: 'function';
+  function: { name: string; description: string; parameters: JsonSchema };
+}> {
+  return [agentToolDefsForProvider(), toolDefsForProvider()].flat();
+}
+
+export function agentToolDefsForProvider(): Array<{
+  type: 'function';
+  function: { name: string; description: string; parameters: JsonSchema };
+}> {
+  return AGENT_TOOL_NAMES.map((name) => {
+    const definition = AGENT_TOOL_DEFINITIONS[name];
+    const schema = z.toJSONSchema(definition.inputSchema, { io: 'input' }) as JsonSchema;
+    delete schema.$schema;
+    return { type: 'function' as const, function: { name, description: definition.description, parameters: schema } };
+  });
+}
+
 /** Validate arguments against the same schema the provider was shown. */
 export function parseToolArguments(name: string, args: unknown): Record<string, unknown> {
-  const definition = projectToolDefinitions[name as keyof typeof projectToolDefinitions];
+  const definition =
+    projectToolDefinitions[name as keyof typeof projectToolDefinitions] ??
+    AGENT_TOOL_DEFINITIONS[name as AgentToolName];
   if (!definition) {
-    throw new Error(`Unknown project tool: ${name}`);
+    throw new Error(
+      `Unknown project tool: ${name}. Available tools: ${[...AGENT_TOOL_NAMES, ...PROJECT_TOOL_NAMES].join(', ')}.`,
+    );
   }
   const parsed = definition.inputSchema.safeParse(args ?? {});
   if (!parsed.success) {

@@ -317,6 +317,12 @@ export function drainPreviewIssues(): string[] {
   return previewIssues.splice(0, previewIssues.length);
 }
 
+/** Drop the queue (project replaced, or the user fixed and reloaded the preview). */
+export function clearPreviewIssues(): void {
+  previewIssues.splice(0, previewIssues.length);
+  previewIssueSeen.clear();
+}
+
 export function previewIssueCount(): number {
   return previewIssues.length;
 }

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { projectRelative, relPath, safePath, toContainerPath, toVirtualPath, WORK_DIR, WORKSPACE_ROOT } from './path';
 import { countLines, getFileRevision, numberLines, replaceLines, replaceText, validateProjectSource } from './sourceCheck';
-import { getProgress, completionProblems, nextInstruction, type AgentPlan } from './loop';
+import { getProgress, completionProblems, nextInstruction, MAX_GATE_NUDGES, type AgentPlan } from './loop';
+import { allToolDefsForProvider, parseToolArguments, AGENT_TOOL_NAMES, PROJECT_TOOL_NAMES } from './projectTools';
+import { reasoningOnly } from './provider';
 
 describe('path jail', () => {
   it('accepts both spellings of the project root', () => {
@@ -191,5 +193,69 @@ describe('completion gate', () => {
     const progress = getProgress([], 'build me an app', 1, true);
     expect(progress.status).toBe('blocked');
     expect(nextInstruction(progress).text).toMatch(/Explain the blocker/);
+  });
+});
+
+// ============================================================================
+// Regressions from a real session transcript: five runs in a row, every one of
+// which reported "no final answer" and one of which was told by the gate to call a
+// tool the harness itself rejected.
+// ============================================================================
+
+describe('agent tools are callable through the same path as project tools', () => {
+  it('parses agent_plan instead of answering "Unknown project tool"', () => {
+    const args = parseToolArguments('agent_plan', {
+      goal: 'add a counter',
+      steps: ['edit', 'run', 'check'],
+      criteria: [{ id: 'c1', description: 'counter increments' }],
+      requiresPreview: true,
+    });
+    expect(args.goal).toBe('add a counter');
+    expect(args.requiresPreview).toBe(true);
+  });
+
+  it('parses agent_complete, including the blocked outcome', () => {
+    expect(parseToolArguments('agent_complete', { outcome: 'complete', summary: 'done' }).outcome).toBe('complete');
+    expect(parseToolArguments('agent_complete', { outcome: 'blocked', summary: 'no network' }).outcome).toBe('blocked');
+  });
+
+  it('still validates the schema and names the available tools on a typo', () => {
+    expect(() => parseToolArguments('agent_plan', { goal: 'x' })).toThrow(/Invalid arguments for agent_plan/);
+    expect(() => parseToolArguments('agent_plann', {})).toThrow(/Available tools: agent_plan, agent_complete/);
+  });
+
+  it('advertises every tool it can execute, and nothing else', () => {
+    const advertised = allToolDefsForProvider().map((def) => def.function.name);
+    const executable = [...AGENT_TOOL_NAMES, ...PROJECT_TOOL_NAMES];
+    expect(advertised.slice().sort()).toEqual(executable.slice().sort());
+    // The provider schema is generated from the same zod object the validator uses.
+    const writeSchema = allToolDefsForProvider().find((def) => def.function.name === 'project_write_file');
+    expect(JSON.stringify(writeSchema?.function.parameters)).toContain('"required":["path","content"]');
+  });
+});
+
+describe('reasoning-only turns are diagnosed, not retried blindly', () => {
+  it('recognises a turn that spent the budget thinking', () => {
+    expect(
+      reasoningOnly({
+        content: '',
+        toolCalls: [],
+        finishReason: 'stop',
+        reasoning: 'Let me think about the file layout…',
+        usage: { completion_tokens: 30000, completion_tokens_details: { reasoning_tokens: 30000 } },
+      }),
+    ).toBe(true);
+  });
+
+  it('does not mistake prose, a tool call, or a plain empty turn for it', () => {
+    expect(reasoningOnly({ content: 'here you go', toolCalls: [], finishReason: 'stop' })).toBe(false);
+    expect(
+      reasoningOnly({
+        content: '',
+        toolCalls: [{ id: '1', function: { name: 'project_list_paths', arguments: '{}' } }],
+        finishReason: 'tool_calls',
+      }),
+    ).toBe(false);
+    expect(reasoningOnly({ content: '', toolCalls: [], finishReason: 'stop', usage: null })).toBe(false);
   });
 });

@@ -17,7 +17,9 @@ import {
   X,
 } from 'lucide-react';
 import { providerSupportsTools, sandboxUnavailableReason } from './support';
+import { AGENT_TOOL_DEFINITIONS, PROJECT_TOOL_NAMES, projectToolDefinitions } from './projectTools';
 import {
+  clearPreviewIssues,
   getContainer,
   listTree,
   onPreview,
@@ -735,6 +737,7 @@ export default function SandboxPanel({
             <div className="min-h-0 flex-1 overflow-auto">
               {tab === 'activity' && (
                 <div className="space-y-1.5 p-3">
+                  <CapabilityPanel providerId={providerId} model={model} toolsOk={toolsOk} />
                   {issues.length > 0 && (
                     <div className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-2">
                       <p className="text-[10px] uppercase tracking-wide text-rose-300">preview reported</p>
@@ -743,6 +746,29 @@ export default function SandboxPanel({
                           {line}
                         </p>
                       ))}
+                      <div className="mt-1.5 flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            clearPreviewIssues();
+                            setIssues([]);
+                          }}
+                          className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-300 hover:bg-zinc-700"
+                        >
+                          dismiss
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIssues([]);
+                            void runTask('Fix the preview errors shown in the activity log, then re-run the app and the checks.');
+                          }}
+                          disabled={running}
+                          className="rounded bg-rose-500/20 px-1.5 py-0.5 text-[10px] text-rose-200 hover:bg-rose-500/30 disabled:opacity-40"
+                        >
+                          ask the agent to fix
+                        </button>
+                      </div>
                     </div>
                   )}
                   {events.length === 0 && (
@@ -1147,5 +1173,71 @@ function ActivityRow({ event }: { event: AgentEvent }) {
         {event.output}
       </pre>
     </details>
+  );
+}
+
+/**
+ * "The AI doesn't know what it can even use" is a UI failure, not a model failure.
+ * The tool surface is fixed and known here — an agent loop over one MCP server plus
+ * two harness tools — so the panel states it instead of leaving the user (and the
+ * model, when it guesses) to discover it by trial and error.
+ *
+ * The list is derived from the same definitions the provider is given, so it cannot
+ * drift from what is actually callable. That drift is exactly what produced
+ * "Unknown project tool: agent_plan" in an earlier build.
+ */
+function CapabilityPanel({ providerId, model, toolsOk }: { providerId: string; model: string; toolsOk: boolean }) {
+  const [open, setOpen] = useState(false);
+  const agentNames = Object.keys(AGENT_TOOL_DEFINITIONS);
+  const groups: Array<{ title: string; names: string[] }> = [
+    { title: 'plan & finish', names: agentNames },
+    { title: 'read', names: ['project_read_file', 'project_list_paths', 'project_search_content', 'project_find_related_files'] },
+    { title: 'write', names: ['project_write_file', 'project_replace_lines', 'project_patch_file', 'project_create_directory', 'project_delete_path'] },
+    { title: 'run', names: ['project_run_command', 'project_get_process_output', 'project_stop_process'] },
+    { title: 'research', names: ['web_search', 'web_fetch'] },
+  ];
+  const total = agentNames.length + PROJECT_TOOL_NAMES.length;
+
+  return (
+    <div className="mb-2 rounded-lg border border-zinc-800 bg-black/30 p-2">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center gap-2 text-left text-[11px] text-zinc-400 hover:text-zinc-200"
+      >
+        <span className="font-semibold text-zinc-300">{total} tools available</span>
+        <span className="truncate text-zinc-600">
+          {toolsOk ? model || 'model not chosen' : `tools disabled for the ${providerId} provider path`}
+        </span>
+        <span className="ml-auto text-zinc-600">{open ? 'hide' : 'what the agent can do'}</span>
+      </button>
+      {open && (
+        <div className="mt-2 space-y-1.5">
+          {groups.map((group) => (
+            <div key={group.title}>
+              <p className="text-[9px] uppercase tracking-wide text-zinc-600">{group.title}</p>
+              <ul className="mt-0.5 space-y-0.5">
+                {group.names.map((name) => {
+                  const description =
+                    (AGENT_TOOL_DEFINITIONS as Record<string, { description: string }>)[name]?.description ??
+                    (projectToolDefinitions as Record<string, { description: string }>)[name]?.description ??
+                    '';
+                  return (
+                    <li key={name} className="flex gap-2 font-mono text-[10px] leading-relaxed">
+                      <span className="shrink-0 text-cyan-400">{name}</span>
+                      <span className="text-zinc-500">{description.split('.')[0]}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ))}
+          <p className="pt-1 text-[10px] leading-relaxed text-zinc-600">
+            Nothing outside this list is callable. The agent cannot install system packages, use Python, reach
+            external hosts (except through web_search / web_fetch), or start a server it cannot preview.
+          </p>
+        </div>
+      )}
+    </div>
   );
 }

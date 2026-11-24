@@ -32,8 +32,28 @@ export type ProviderTurnAnswer = {
   toolCalls: ToolCall[];
   finishReason: string | null;
   reasoning?: string;
-  usage?: unknown;
+  usage?: {
+    completion_tokens?: number;
+    completion_tokens_details?: { reasoning_tokens?: number };
+    [key: string]: unknown;
+  } | null;
 };
+
+/**
+ * Was the budget spent on thinking rather than on an answer? Measured on real
+ * providers: a reasoning model given a generous max_tokens can emit 30k of
+ * reasoning, zero content and no tool call, and `finish_reason` stays "stop". The
+ * loop has to recognise that, because retrying the same request unchanged produces
+ * the same nothing.
+ */
+export function reasoningOnly(answer: ProviderTurnAnswer): boolean {
+  if (answer.content.trim() || answer.toolCalls.length > 0) {
+    return false;
+  }
+  const completion = Number(answer.usage?.completion_tokens ?? 0);
+  const reasoning = Number(answer.usage?.completion_tokens_details?.reasoning_tokens ?? 0);
+  return Boolean(answer.reasoning?.trim()) || reasoning > 0 || completion > 0;
+}
 
 export async function callModel(request: ProviderTurnRequest): Promise<ProviderTurnAnswer> {
   const response = await fetch('/api/sandbox/turn', {
@@ -75,6 +95,6 @@ export async function callModel(request: ProviderTurnRequest): Promise<ProviderT
     toolCalls: Array.isArray(message.tool_calls) ? message.tool_calls : [],
     finishReason: body.finishReason ?? null,
     reasoning: body.reasoningContent,
-    usage: body.usage,
+    usage: (body.usage ?? null) as ProviderTurnAnswer['usage'],
   };
 }

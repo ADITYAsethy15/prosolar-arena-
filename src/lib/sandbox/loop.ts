@@ -18,14 +18,16 @@
 // That is what makes a small model usable for real work: the sequence lives in the
 // harness, not in the model's willingness to follow a 40-line prompt.
 // ============================================================================
-import { callModel, type ProviderTurnRequest } from './provider';
+import { callModel, reasoningOnly, type ProviderTurnRequest } from './provider';
 import { callProjectTool, parseToolArguments, type ToolResult } from './projectMcp';
-import { toolDefsForProvider } from './projectTools';
+import { allToolDefsForProvider } from './projectTools';
 import { projectStore } from './project';
 import { drainPreviewIssues, listPreviews } from './container';
 import { clampRounds } from './mode';
 
 export const MAX_AGENT_STEPS = 32;
+/** How many times the gate may hand the model a "NEXT REQUIRED ACTION" it ignored. */
+export const MAX_GATE_NUDGES = 2;
 
 export type AgentEvent =
   | { kind: 'round'; round: number; limit: number }
@@ -310,56 +312,16 @@ export function nextInstruction(progress: Progress): { text: string; next: strin
   };
 }
 
-const PLAN_TOOL = {
-  type: 'function' as const,
-  function: {
-    name: 'agent_plan',
-    description:
-      'Record a concise task plan and observable completion criteria before editing. Each criterion has an id and a description. Use unique, stable ids. Require a preview for a web app, and preserve the existing project on follow-up requests.',
-    parameters: {
-      type: 'object',
-      properties: {
-        goal: { type: 'string' },
-        steps: { type: 'array', items: { type: 'string' } },
-        criteria: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: { id: { type: 'string' }, description: { type: 'string' } },
-            required: ['id', 'description'],
-          },
-        },
-        requiresPreview: { type: 'boolean' },
-      },
-      required: ['goal', 'steps', 'criteria', 'requiresPreview'],
-    },
-  },
-};
-
-const COMPLETE_TOOL = {
-  type: 'function' as const,
-  function: {
-    name: 'agent_complete',
-    description:
-      'Finish the current task only after running it and passing relevant checks after the latest edit. Report every planned criterion by its exact id. Evidence from successful project tool calls is attached automatically. Use outcome "blocked" with a concrete reason if completion is impossible.',
-    parameters: {
-      type: 'object',
-      properties: {
-        outcome: { type: 'string', enum: ['complete', 'blocked'] },
-        summary: { type: 'string' },
-        criteria: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: { id: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' } } },
-            required: ['id'],
-          },
-        },
-      },
-      required: ['outcome', 'summary'],
-    },
-  },
-};
+/**
+ * Used when a model produced reasoning but no answer and no tool call. Saying
+ * "answer now" is not enough — the useful instruction names the constraint that
+ * caused it: a huge thinking budget.
+ */
+const NO_ANSWER_NUDGE = [
+  'Your previous turn spent the whole budget on internal reasoning and returned neither an answer nor a tool call.',
+  'Do not deliberate further: either call ONE tool now with the arguments its schema requires, or reply in prose with what you know so far.',
+  'Keep reasoning to a sentence or two. If you were trying to plan, call agent_plan with goal, steps, criteria and requiresPreview instead of describing the plan.',
+].join('\n');
 
 const SYSTEM_PROMPT = [
   'You are a coding agent operating a real Node.js sandbox in the user\u2019s browser, rooted at the project (tools call it /workspace, the shell sees the project root).',
@@ -389,7 +351,7 @@ export type RunOptions = {
 /** One job of the whole loop. Returns the final prose the model produced. */
 export async function runAgentTask(options: RunOptions): Promise<string> {
   const rounds = clampRounds(options.maxRounds);
-  const tools = [PLAN_TOOL, COMPLETE_TOOL, ...toolDefinitions()];
+  const tools = toolDefinitions();
   const messages: Array<Record<string, unknown>> = [
     { role: 'system', content: SYSTEM_PROMPT },
     ...options.history.slice(-8).map((turn) => ({ role: turn.role, content: turn.content })),
@@ -397,7 +359,16 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
   ];
 
   const calls: CallRecord[] = [];
+  /** Model requests spent, which is what a caller's provider quota is charged for. */
   let stepCount = 0;
+  /** Rounds in which the model asked for at least one tool. */
+  let toolRounds = 0;
+  /** Gate nudges appended so the model gets a bounded number of second chances. */
+  let nudges = 0;
+  /** One extra request when the model reasoned without answering. */
+  let reasoningRetried = false;
+  /** The next prose answer is the task summary the gate asked for. */
+  let gateSummaryPending = false;
   let finalText = '';
   let upstreamCalls = 0;
   let denied = false;
@@ -405,7 +376,7 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
 
   options.emit({
     kind: 'log',
-    text: `budget: ${rounds} tool call(s), up to ${(options.maxTokens ?? 8192).toLocaleString()} tokens per turn`,
+    text: `budget: ${rounds} model request(s), up to ${(options.maxTokens ?? 8192).toLocaleString()} tokens per turn — plus at most ${MAX_GATE_NUDGES} gate nudge(s) and 1 summary request`,
   });
 
   for (let round = 1; round <= rounds; round++) {
@@ -426,11 +397,12 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
           role: 'user',
           content: `The running preview reported these problems:\n${issues
             .map((line) => `- ${line}`)
-            .join('\n')}\nFix them if you can instead of only reporting them.`,
+            .join('\n')}\nThese are real exceptions from the page currently being served, but they may predate your latest edits — check the file before changing it, and fix them if they are still reproducible.`,
         });
       }
     }
 
+    stepCount += 1;
     options.emit({ kind: 'round', round, limit: rounds });
 
     let answer;
@@ -494,15 +466,40 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
     if (answer.content.trim()) {
       options.emit({ kind: 'text', text: answer.content });
       finalText = answer.content;
-    } else if (answer.reasoning?.trim()) {
-      options.emit({
-        kind: 'log',
-        text: `no final answer; last reasoning: ${answer.reasoning.slice(-400).trim()}`,
-      });
+    } else if (answer.reasoning?.trim() && toolCalls.length === 0) {
+      // Only worth saying when the model ALSO failed to call a tool. A tool-calling
+      // turn that carries reasoning and no prose is normal: every round of a real
+      // build looks like that, and printing "no final answer" over it made a working
+      // run read like ten errors in a row.
+      options.emit({ kind: 'log', text: `(reasoning only, no prose) ${trimReasoning(answer.reasoning)}` });
     }
 
     if (toolCalls.length === 0) {
+      if (gateSummaryPending && answer.content.trim()) {
+        // This is the requested summary; it is the answer, not another gate round.
+        finalText = answer.content;
+        break;
+      }
       if (!answer.content.trim()) {
+        // Three distinct failures used to share one unhelpful message. They need
+        // different advice, because only one of them is fixed by raising max tokens.
+        if (reasoningOnly(answer)) {
+          if (reasoningRetried) {
+            options.emit({
+              kind: 'error',
+              text: `Model spent its budget on reasoning and produced no answer or tool call (reasoning tokens: ${
+                answer.usage?.completion_tokens_details?.reasoning_tokens ?? 'unknown'
+              }). Retry with a SMALLER max-tokens budget in the sandbox panel — reasoning models often answer only when the budget forces them to stop deliberating — or pick a non-reasoning model.`,
+            });
+            break;
+          }
+          reasoningRetried = true;
+          options.emit({ kind: 'log', text: 'model reasoned without answering — asking it once more, harder' });
+          messages.push({ role: 'user', content: `${NO_ANSWER_NUDGE}\n\nNEXT REQUIRED ACTION: ${
+            nextInstruction(getProgress(calls, options.prompt, toolRounds, denied)).next
+          }` });
+          continue;
+        }
         const why =
           answer.finishReason === 'length'
             ? 'ran out of tokens (finish_reason=length) — raise max tokens'
@@ -512,29 +509,33 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
       }
       // An answer with prose and no call is not necessarily done: re-derive the next
       // required step and push it back. This is the gate that stops "looks right".
-      const progress = getProgress(calls, options.prompt, stepCount, denied);
+      const progress = getProgress(calls, options.prompt, toolRounds, denied);
       if (progress.status === 'inactive' || progress.status === 'ready' || progress.status === 'blocked') {
         break;
       }
       const { text, next } = nextInstruction(progress);
-      if (round === rounds) {
+      // A nudge costs this harness one request, not a tool call — but it must be
+      // bounded, and it must never be issued when there is no round left to act on it.
+      // (The old code nudged on the last round too and reported a budget-exhausted
+      // answer as if the agent had simply stopped.)
+      if (round >= rounds || nudges >= MAX_GATE_NUDGES) {
         options.emit({ kind: 'gate', problems: completionProblems(progress), next });
-        finalText = `${finalText}\n\n_Stopped at the tool budget before: ${next}_`.trim();
+        finalText = `${finalText}\n\n_Stopped before the task was verified — next required step was: ${next}_`.trim();
         break;
       }
+      nudges += 1;
       options.emit({ kind: 'gate', problems: completionProblems(progress), next });
       messages.push({ role: 'user', content: `${text}\n\nNEXT REQUIRED ACTION: ${next}` });
-      stepCount += 1;
       continue;
     }
 
+    toolRounds += 1;
     for (const call of toolCalls) {
       if (options.signal?.aborted) {
         stopped = true;
         break;
       }
       const name = String(call.function?.name ?? '');
-      stepCount += 1;
       let args: Record<string, unknown> = {};
       try {
         args = parseToolArguments(name, JSON.parse(String(call.function?.arguments ?? '{}') || '{}'));
@@ -565,15 +566,27 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
       messages.push({ role: 'tool', tool_call_id: call.id, content: outcome.text.slice(0, 60_000) });
     }
 
-    const progress = getProgress(calls, options.prompt, stepCount, denied);
+    const progress = getProgress(calls, options.prompt, toolRounds, denied);
     if (progress.status === 'ready') {
       options.emit({ kind: 'log', text: 'completion gate accepted the task' });
+      // One more request for the summary the user actually reads. Breaking here used
+      // to leave the chat with an empty answer after a successful task: the gate was
+      // satisfied, the work was done, and the transcript said nothing at all.
+      if (round < rounds) {
+        messages.push({
+          role: 'user',
+          content:
+            'The completion gate accepted this task. Reply now in prose — no tool calls — with a short summary: files changed, checks that passed, and how each criterion was met.',
+        });
+        gateSummaryPending = true;
+        continue;
+      }
       break;
     }
     if (progress.status === 'blocked') {
       break;
     }
-    if (stepCount >= MAX_AGENT_STEPS) {
+    if (toolRounds >= MAX_AGENT_STEPS) {
       options.emit({ kind: 'log', text: `step limit reached (${MAX_AGENT_STEPS})` });
       break;
     }
@@ -730,7 +743,15 @@ export function setApprovalSink(sink: ApprovalSink | null): void {
 }
 
 function toolDefinitions() {
-  return toolDefsForProvider();
+  // One list, built from the same zod schemas the argument validator uses: the loop
+  // cannot advertise a tool it will refuse to run.
+  return allToolDefsForProvider();
+}
+
+/** The tail of a reasoning trace, on one line: enough to judge it, short enough to read. */
+function trimReasoning(text: string, max = 220): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `…${flat.slice(-max)}` : flat;
 }
 
 function cameraId(value: unknown): string {
