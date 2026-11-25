@@ -18,6 +18,7 @@ import {
   type TavilyStrategy,
 } from '../types';
 import { validateCustomBaseUrl, validateCustomName } from '../lib/providers';
+import { checkBaseUrl } from '../lib/localProviders';
 
 interface ConnectionSettingsModalProps {
   isOpen: boolean;
@@ -79,7 +80,7 @@ export const ConnectionSettingsModal: React.FC<ConnectionSettingsModalProps> = (
         const otherId = slotId === 'custom1' ? 'custom2' : 'custom1';
         const trimmedUrl = slot.baseUrl.trim();
         if (trimmedUrl) {
-          slot.baseUrl = validateCustomBaseUrl(trimmedUrl);
+          slot.baseUrl = validateCustomBaseUrl(trimmedUrl, { allowLanHttp: slot.allowLanHttp === true });
           slot.name = validateCustomName(slot.name || (slotId === 'custom1' ? 'Custom #1' : 'Custom #2'), nextCustom[otherId].name);
         } else {
           slot.baseUrl = '';
@@ -228,7 +229,7 @@ export const ConnectionSettingsModal: React.FC<ConnectionSettingsModalProps> = (
           {tab === 'custom' && (
             <div className="space-y-3">
               <p className="text-[11px] text-zinc-400">
-                Configure up to 2 custom OpenAI-compatible HTTPS endpoints (e.g. Arena API <code className="text-zinc-300">https://api.arena.ai/v1</code>). <code className="text-zinc-300">max_tokens</code> is always sent explicitly.
+                Configure up to 2 custom OpenAI-compatible endpoints (e.g. Arena API <code className="text-zinc-300">https://api.arena.ai/v1</code>, or a local server such as <code className="text-zinc-300">http://192.168.1.20:8080/v1</code>). Plain http is accepted for localhost and private/LAN addresses; <code className="text-zinc-300">max_tokens</code> is always sent explicitly.
               </p>
               {(['custom1', 'custom2'] as const).map((slotId, index) => {
                 const slot = customDraft[slotId];
@@ -284,7 +285,7 @@ export const ConnectionSettingsModal: React.FC<ConnectionSettingsModalProps> = (
                       </div>
                       <div>
                         <label className="block text-[10px] font-semibold uppercase tracking-wider text-zinc-500 mb-1">
-                          HTTPS Base URL
+                          Base URL (https, or http on your LAN)
                         </label>
                         <input
                           type="url"
@@ -295,9 +296,36 @@ export const ConnectionSettingsModal: React.FC<ConnectionSettingsModalProps> = (
                               [slotId]: { ...prev[slotId], baseUrl: e.target.value },
                             }))
                           }
-                          placeholder="https://api.arena.ai/v1"
+                          placeholder="https://api.arena.ai/v1  ·  http://192.168.1.20:8080/v1"
                           className="w-full px-2.5 py-1.5 rounded-lg bg-black border border-zinc-800 text-xs font-mono text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/60"
                         />
+                        {/* Say what the rule will do before Save does it. */}
+                        {(() => {
+                          const verdict = slot.baseUrl.trim() ? checkBaseUrl(slot.baseUrl, { allowLanHttp: slot.allowLanHttp === true }) : null;
+                          if (!verdict) {
+                            return null;
+                          }
+                          return (
+                            <p className={`mt-1 text-[10px] ${verdict.allowed ? 'text-zinc-500' : 'text-rose-400'}`}>
+                              {verdict.allowed ? `${verdict.scope}: ` : ''}
+                              {verdict.reason}
+                            </p>
+                          );
+                        })()}
+                        <label className="mt-1.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
+                          <input
+                            type="checkbox"
+                            className="accent-cyan-500"
+                            checked={slot.allowLanHttp === true}
+                            onChange={(e) =>
+                              setCustomDraft((prev) => ({
+                                ...prev,
+                                [slotId]: { ...prev[slotId], allowLanHttp: e.target.checked },
+                              }))
+                            }
+                          />
+                          allow plain http to any host (tunnelled local server — key is readable on the path)
+                        </label>
                       </div>
                     </div>
 

@@ -96,6 +96,10 @@ map and the reasoning behind each piece.
   400k-cell cap, so a 4000-line file cannot stall the tab.
 - **The conversation survives a reload.** The transcript is saved to IndexedDB alongside the project, so a
   refreshed tab shows the last thread next to the files, not an empty log in front of a finished project.
+- **Local model servers work over plain http on your LAN.** `http://192.168.1.20:8080/v1`
+  (Ollama, LM Studio, llama.cpp, vLLM) is accepted alongside https URLs; loopback and
+  private ranges need no opt-in, a public http host needs an explicit switch, and the
+  settings form says which rule applied before you save.
 - **Ported from OpenHands:** a `never / risky / always` confirmation policy with real risk
   classification (destructive commands, secrets, the lockfile) instead of one auto-approve
   checkbox; stuck detection (repeated identical calls, repeated failures, and read-only

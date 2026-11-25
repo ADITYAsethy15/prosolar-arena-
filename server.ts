@@ -7,6 +7,9 @@ import path from 'path';
 import fs from 'fs';
 import { Agent, fetch as undiciFetch, setGlobalDispatcher } from 'undici';
 import type { Mode, ModelCapability, ProviderId } from './src/types';
+// The same https/LAN rule the browser applies, imported rather than duplicated: a server
+// that disagreed with the settings form would reject URLs the form had just accepted.
+import { checkBaseUrl } from './src/lib/localProviders';
 import {
   buildGeminiThinkingAttempts,
   buildLearnedCapability,
@@ -75,7 +78,7 @@ app.use(express.urlencoded({ limit: '30mb', extended: true }));
 // sets a 7-day HttpOnly cookie; /api/* without it gets 401 JSON.
 // Change PW to rotate the password (change KEY too). No client code changes.
 // ============================================================================
-const PW = 'solarauniversa';
+const PW = 'agentsol';
 const KEY = 'f7471b0f3d5d529a25174e24bcdd4833'; // random cookie value, moves with PW (deliberately NOT the password)
 
 // Whitespace-normalized copies used for the actual comparisons. The password
@@ -756,6 +759,24 @@ function detectSoftError(json: any): string | null {
 }
 
 /**
+ * Is this base URL allowed to be proxied?
+ *
+ * Same rule as the browser (`src/lib/localProviders.ts`), deliberately: https anywhere;
+ * plain http to loopback and to private/LAN addresses (a model server on the user's own
+ * machine — the case that used to be refused with "must use an https URL"); plain http to
+ * a public host only with `SOLARA_ALLOW_LAN_HTTP=1` or `allowLanHttp: true` on the request.
+ *
+ * The error text names the host when it refuses, because "must use https" for
+ * `http://192.168.1.20:8080/v1` reads like a bug when that server can never offer TLS.
+ */
+function allowedBaseUrl(baseUrl: string, allowLan?: unknown): string | null {
+  const verdict = checkBaseUrl(baseUrl, {
+    allowLanHttp: allowLan === true || process.env.SOLARA_ALLOW_LAN_HTTP === '1',
+  });
+  return verdict.allowed ? null : verdict.reason;
+}
+
+/**
  * Parallel tool calls: the whole point is that one response can carry several calls, so
  * N edits cost one request instead of N. OpenAI's API defaults this on, but gateways
  * differ — some omit the field, some (older Azure deployments, a few compat shims)
@@ -808,20 +829,11 @@ app.post('/api/sandbox/turn', async (req, res) => {
   const messages = Array.isArray(body.messages) ? (body.messages as unknown[]).slice(0, 64) : [];
   const tools = Array.isArray(body.tools) ? (body.tools as unknown[]).slice(0, 16) : undefined;
 
-  // https everywhere, except loopback: local model servers (Ollama, LM Studio) speak plain
-  // http on 127.0.0.1, and refusing those would only teach users to disable TLS checking
-  // globally. Remote http stays rejected.
-  let turnHost = '';
-  try {
-    turnHost = new URL(baseUrl).hostname;
-  } catch {
-    turnHost = '';
-  }
-  const loopback = turnHost === 'localhost' || turnHost === '127.0.0.1' || turnHost === '[::1]';
-  if (!/^https:\/\//i.test(baseUrl) && !(loopback && /^http:\/\//i.test(baseUrl))) {
-    return res
-      .status(400)
-      .json({ error: 'baseUrl must be an https URL (http is allowed only for localhost)' });
+  // https anywhere; plain http to loopback AND to private/LAN addresses, because a model
+  // server on the user's own machine or LAN is the normal local case (see allowedBaseUrl).
+  const turnBlocked = allowedBaseUrl(baseUrl, body.allowLanHttp);
+  if (turnBlocked) {
+    return res.status(400).json({ error: turnBlocked });
   }
   if (!apiKey || !model || messages.length === 0) {
     return res.status(400).json({ error: 'apiKey, model and messages are required' });
@@ -980,15 +992,9 @@ app.post('/api/sandbox/stream', async (req, res) => {
   const messages = Array.isArray(body.messages) ? (body.messages as unknown[]).slice(0, 64) : [];
   const tools = Array.isArray(body.tools) ? (body.tools as unknown[]).slice(0, 24) : undefined;
 
-  let host = '';
-  try {
-    host = new URL(baseUrl).hostname;
-  } catch {
-    host = '';
-  }
-  const loopback = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
-  if (!/^https:\/\//i.test(baseUrl) && !(loopback && /^http:\/\//i.test(baseUrl))) {
-    return res.status(400).json({ error: 'baseUrl must be an https URL (http is allowed only for localhost)' });
+  const streamBlocked = allowedBaseUrl(baseUrl, body.allowLanHttp);
+  if (streamBlocked) {
+    return res.status(400).json({ error: streamBlocked });
   }
   if (!apiKey || !model || messages.length === 0) {
     return res.status(400).json({ error: 'apiKey, model and messages are required' });
@@ -1221,6 +1227,14 @@ app.post('/api/models', async (req, res) => {
 
   if (!baseUrl) {
     return res.status(400).json({ error: 'Provider base URL is not configured.' });
+  }
+
+  // Model listing goes through the same rule as the chat proxy: a LAN model server must be
+  // able to list its own models, or the custom-provider form accepts the URL and then has
+  // nothing to put in the model picker.
+  const baseBlocked = allowedBaseUrl(baseUrl, (req.body as { allowLanHttp?: unknown }).allowLanHttp);
+  if (baseBlocked) {
+    return res.status(400).json({ error: baseBlocked });
   }
 
   const key = resolveEffectiveKey(providerId, rawApiKey);

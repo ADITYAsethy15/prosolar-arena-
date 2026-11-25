@@ -78,6 +78,11 @@ export interface CustomProviderSlot {
   name: string;
   baseUrl: string;
   apiKey: string;
+  /**
+   * Opt-in for plain http to a *public* host (a local model server tunnelled through an
+   * http hostname). loopback and LAN addresses never need this.
+   */
+  allowLanHttp?: boolean;
 }
 
 export type CascadeConfig = Record<ProviderId, string[]>;

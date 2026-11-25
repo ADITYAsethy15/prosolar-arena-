@@ -147,3 +147,41 @@ clean directory and re-verified: `npm ci` (357 packages) → `npx vitest run` (3
 `npm run build` (`dist/rg.wasm` present) → `npm start` → `/healthz` `{"ok":true}` →
 unlock → `/api/sandbox/stream` returned a full SSE turn (reasoning, text, tool_delta,
 done with usage).
+
+---
+
+## Local model servers over plain http (why it used to be refused)
+
+The error *"Custom provider base URL must use HTTPS"* was a deliberate rule, not an
+accident — but it was too blunt, and it made the most common local setup impossible: a
+model server (Ollama, LM Studio, llama.cpp, vLLM, Jan) reached at the machine's **LAN**
+address rather than `127.0.0.1`.
+
+The rule is now explicit, and identical in the browser and in the proxy
+(`src/lib/localProviders.ts`, imported by both):
+
+| Base URL | Verdict |
+| --- | --- |
+| `https://…` | allowed, anywhere |
+| `http://localhost`, `127.0.0.1`, `[::1]`, `*.localhost` | allowed — never leaves the machine |
+| `http://10.x`, `192.168.x`, `172.16–31.x`, `169.254.x`, `100.64–127.x`, IPv6 `fc00::/7` / `fe80::/10` | allowed — private network |
+| `http://mylaptop`, `*.local`, `*.lan`, `*.home`, `*.internal` | allowed — mDNS/local name |
+| `http://<public host>` | refused **unless** you opt in |
+
+Two opt-ins for the public-http case (a local server tunnelled through an http hostname):
+the **"allow plain http to any host"** checkbox per custom slot, or
+`SOLARA_ALLOW_LAN_HTTP=1` on the server. They are off by default because enabling them
+silently would make every key sent to any http host readable on the path.
+
+**Only the local copy can reach your laptop.** The server does the upstream request, so:
+
+- Running Solara on your laptop (`npm run dev` / `npm start`) → `http://192.168.1.20:8080/v1`
+  works.
+- Running it on Render → `http://192.168.1.20:8080/v1` is unreachable: Render's container
+  cannot see your home network, and browsers block a public https page from calling a
+  private http address (Private Network Access). For a deployed instance, put the model
+  behind an https tunnel (cloudflared, ngrok, tailscale funnel) or point the provider slot
+  at that https URL instead.
+
+Also checked while fixing this: `POST /api/models` now applies the same rule, so a LAN
+server can list its models and fill the model picker.

@@ -17,6 +17,8 @@ export function hasControlChars(text: string): boolean {
   return false;
 }
 
+import { checkBaseUrl } from './localProviders';
+
 /** A base and its full chat URL describe the same API. Never redirect keys. */
 export function apiBase(raw: string): string {
   const text = raw.trim();
@@ -54,13 +56,22 @@ export function canonicalOrEmpty(raw: string): string {
   }
 }
 
-export function validateCustomBaseUrl(raw: string): string {
+/**
+ * @param opts.allowLanHttp opt-in from the provider settings ("allow plain http to any
+ * host"), for a local server tunnelled through a public http hostname.
+ *
+ * Plain http is allowed to loopback and to private/LAN addresses without any opt-in: a
+ * model server on the user's own machine or LAN is the normal case, and refusing it only
+ * pushed people towards disabling TLS checks. The reasoning lives in localProviders.ts so
+ * the server applies exactly the same rule.
+ */
+export function validateCustomBaseUrl(raw: string, opts: { allowLanHttp?: boolean } = {}): string {
   const text = raw.trim();
   if (!text) return '';
   const base = apiBase(text);
-  const url = new URL(base);
-  if (url.protocol !== 'https:') {
-    throw new Error('Custom provider base URL must use HTTPS.');
+  const verdict = checkBaseUrl(base, opts);
+  if (!verdict.allowed) {
+    throw new Error(verdict.reason);
   }
   return base;
 }

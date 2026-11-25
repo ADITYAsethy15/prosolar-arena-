@@ -149,3 +149,49 @@ describe('history condensation', () => {
     expect(JSON.stringify(result).length).toBeLessThan(JSON.stringify(turns).length);
   });
 });
+
+describe('plain-http local model servers are allowed, public http is not', () => {
+  it('accepts loopback and LAN addresses', async () => {
+    const { checkBaseUrl } = await import('../localProviders');
+    for (const url of [
+      'http://localhost:8080/v1',
+      'http://127.0.0.1:11434/v1',
+      'http://192.168.1.20:8080/v1',
+      'http://10.0.0.5:1234/v1',
+      'http://172.16.4.2:8000/v1',
+      'http://[::1]:8080/v1',
+      'http://mylaptop:8080/v1',
+      'http://gpu-box.local:8080/v1',
+      'https://api.openai.com/v1',
+    ]) {
+      expect(checkBaseUrl(url).allowed, url).toBe(true);
+    }
+  });
+
+  it('refuses plain http to a public host, and says how to override', async () => {
+    const { checkBaseUrl } = await import('../localProviders');
+    const verdict = checkBaseUrl('http://api.example.com/v1');
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.reason).toMatch(/API key in the clear/i);
+    expect(verdict.reason).toMatch(/allow plain http to any host/i);
+    // The opt-in exists for tunnelled local servers, and it is per-request.
+    expect(checkBaseUrl('http://api.example.com/v1', { allowLanHttp: true }).allowed).toBe(true);
+  });
+
+  it('tags the scope so the settings form can explain the rule', async () => {
+    const { checkBaseUrl } = await import('../localProviders');
+    expect(checkBaseUrl('https://x.dev/v1').scope).toBe('https');
+    expect(checkBaseUrl('http://localhost/v1').scope).toBe('loopback');
+    expect(checkBaseUrl('http://192.168.0.9:8080/v1').scope).toBe('private');
+  });
+
+  it('accepts a LAN url through the settings validator that used to throw', async () => {
+    const { validateCustomBaseUrl } = await import('../providers');
+    expect(validateCustomBaseUrl('http://192.168.1.20:8080/v1')).toBe('http://192.168.1.20:8080/v1');
+    // Trailing /chat/completions is still normalised, as before.
+    expect(validateCustomBaseUrl('http://192.168.1.20:8080/v1/chat/completions')).toBe(
+      'http://192.168.1.20:8080/v1',
+    );
+    expect(() => validateCustomBaseUrl('http://api.example.com/v1')).toThrow(/cleartext|clear|https/i);
+  });
+});
