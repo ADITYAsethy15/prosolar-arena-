@@ -75,7 +75,7 @@ app.use(express.urlencoded({ limit: '30mb', extended: true }));
 // sets a 7-day HttpOnly cookie; /api/* without it gets 401 JSON.
 // Change PW to rotate the password (change KEY too). No client code changes.
 // ============================================================================
-const PW = 'agentsol';
+const PW = 'solarauniversa';
 const KEY = 'f7471b0f3d5d529a25174e24bcdd4833'; // random cookie value, moves with PW (deliberately NOT the password)
 
 // Whitespace-normalized copies used for the actual comparisons. The password
