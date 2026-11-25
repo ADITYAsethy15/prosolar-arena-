@@ -40,6 +40,7 @@ import { runShell } from './runner';
 import { createAutoSaver, clearProject, clearThread, loadThread, saveThread } from './persist';
 import { closeProjectBridge } from './projectMcp';
 import { runAgentTask, setApprovalSink, type AgentEvent } from './loop';
+import { getPolicy, POLICY_KEY, savePolicy, type ConfirmationPolicy } from './policy';
 import {
   clampBatch,
   clampRounds,
@@ -87,7 +88,7 @@ export type SandboxPanelProps = {
   history: Array<{ role: 'user' | 'assistant'; content: string }>;
 };
 
-type Approval = { tool: string; detail: string; resolve: (ok: boolean) => void };
+type Approval = { tool: string; detail: string; risk: 'low' | 'medium' | 'high'; resolve: (ok: boolean) => void };
 
 type UsageTotals = {
   toolCalls: number;
@@ -140,9 +141,13 @@ export default function SandboxPanel({
   const [snapshotNote, setSnapshotNote] = useState('');
   const [bigPreview, setBigPreview] = useState(false);
   const [locks, setLocks] = useState(() => projectStore.lockedSummary());
-  const [autoApprove, setAutoApprove] = useState<boolean>(
-    () => typeof localStorage !== 'undefined' && localStorage.getItem(AUTO_KEY) === '1',
-  );
+  /**
+   * OpenHands' confirmation policy, not a boolean: `risky` asks only about destructive
+   * actions, which is the setting that keeps the card meaningful. The old auto-approve
+   * checkbox maps onto `never`.
+   */
+  const [policy, setPolicy] = useState<ConfirmationPolicy>(() => getPolicy());
+  const autoApprove = policy === 'never';
   const [rounds, setRounds] = useState<string>(() => String(getRounds()));
   // Tool calls allowed in ONE model response. Raising this is what turns five rounds
   // into one: the model writes every independent file in a single answer.
@@ -383,15 +388,23 @@ export default function SandboxPanel({
           // Stop must answer the card, not leave the loop parked on a click nobody
           // will ever make.
           request.signal?.addEventListener('abort', () => resolve(false), { once: true });
-          setApproval({ tool: request.tool, detail: request.detail, resolve });
+          setApproval({ tool: request.tool, detail: request.detail, risk: request.risk, resolve });
         }),
     );
     return () => setApprovalSink(null);
   }, [open, autoApprove]);
 
   useEffect(() => {
-    localStorage.setItem(AUTO_KEY, autoApprove ? '1' : '0');
-  }, [autoApprove]);
+    // Migrate the old boolean once: someone who had auto-approve on should not suddenly
+    // start getting risky-action cards, and the reverse would be a nasty surprise.
+    if (typeof localStorage === 'undefined' || localStorage.getItem(POLICY_KEY)) {
+      return;
+    }
+    if (localStorage.getItem(AUTO_KEY) === '1') {
+      const migrated = savePolicy('never');
+      setPolicy(migrated);
+    }
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(PARALLEL_KEY, parallel ? '1' : '0');
@@ -679,6 +692,7 @@ export default function SandboxPanel({
         maxRounds: budget,
         maxToolCallsPerRound: clampBatch(batch),
         parallelToolCalls: parallel,
+        confirmationPolicy: policy,
         singleShot: singleShot ?? budget < SINGLE_SHOT_BELOW,
         showThinking,
         emit: log,
@@ -897,14 +911,31 @@ export default function SandboxPanel({
                   )}
                 </button>
               ))}
-              <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-[11px] text-zinc-500">
-                <input
-                  type="checkbox"
-                  className="accent-cyan-500"
-                  checked={autoApprove}
-                  onChange={(event) => setAutoApprove(event.target.checked)}
-                />
-                auto-approve
+              <label
+                className="ml-auto flex items-center gap-1.5 text-[11px] text-zinc-500"
+                title="When the agent must ask before acting. risky (default) asks only for destructive commands, protected paths and installs; always asks for every write and command; never runs unattended."
+              >
+                confirm
+                <select
+                  value={policy}
+                  onChange={(event) => {
+                    const next = savePolicy(event.target.value);
+                    setPolicy(next);
+                    // A pending card that the new policy would not have raised must not
+                    // stay on screen pretending to block the task.
+                    if (next === 'never') {
+                      setApproval((current) => {
+                        current?.resolve(true);
+                        return null;
+                      });
+                    }
+                  }}
+                  className="rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 text-[10px] text-zinc-300"
+                >
+                  <option value="never">never</option>
+                  <option value="risky">risky</option>
+                  <option value="always">always</option>
+                </select>
               </label>
             </nav>
 
@@ -912,6 +943,9 @@ export default function SandboxPanel({
               <div className="border-b border-rose-500/40 bg-rose-500/10 p-3">
                 <p className="text-[11px] font-semibold uppercase tracking-wide text-rose-300">
                   approve {approval.tool.replace('project_', '').replace('_', ' ')}?
+                  <span className="ml-2 rounded bg-rose-500/20 px-1 py-0.5 text-[9px] font-normal normal-case tracking-normal text-rose-200">
+                    {approval.risk} risk · policy: {policy}
+                  </span>
                 </p>
                 <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-black/50 p-2 font-mono text-[11px] text-rose-100">
                   {approval.detail}

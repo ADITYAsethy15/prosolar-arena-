@@ -272,3 +272,74 @@ each targeting a different part of it:
 
 That is why the budget line in the activity log now names the mode: the old text promised
 "2 gate nudges and 1 summary request" that a single-shot run never spends.
+
+---
+
+## Four things ported from OpenHands (v13)
+
+Checked against [All-Hands-AI/OpenHands](https://github.com/All-Hands-AI/OpenHands) at
+`47eed01` (v1.45.0, the Agent Canvas frontend + agent-server adapter). Only the pieces
+that need **no backend** were taken: everything below runs in the tab, in TypeScript,
+with no Python and no service. The rest of OpenHands — the runtime container, the
+automation server, ACP agents — is a different architecture and was deliberately not
+copied.
+
+### 1. Confirmation policy (`policy.ts`)
+
+Their `getConversationConfirmationPolicy()` returns `NeverConfirm`, `ConfirmRisky` or
+`AlwaysConfirm`. We had one checkbox, `auto-approve`, which is only the two extremes and
+trained people to click through cards. Now the nav has `confirm: never | risky | always`,
+default **risky**: high-risk actions ask, everything else runs.
+
+Risk is classified, not guessed: `rm -rf`, `git reset --hard`, `git push --force`,
+pipe-to-shell, `sudo`, `mkfs`, `dd`, `chmod 777`, plus writes to `.env*`, `.git/*`,
+`*.pem`/`*.key` and `package-lock.json`. Installs and `git checkout` are *medium* — visible
+in the card, not worth stopping for. `risky` confirms only `high`; that is the difference
+between a policy and a nag.
+
+### 2. Stuck detection (`stuck.ts`)
+
+Every OpenHands conversation runs with `stuck_detection: true`. Ours had none, which is
+exactly how a run burns a 3-request budget on `project_list_paths` then
+`project_read_file package.json` then `project_read_file main.js`. The detector is narrow
+on purpose:
+
+| Pattern | Verdict |
+| --- | --- |
+| the same call (name + args, key-order independent) twice in a row | `repeated-call` |
+| …and both failed | `repeated-failure` |
+| 4 read-only calls in a row with no write or run | `read-only` |
+
+On a hit the loop injects the corrective message and continues — one request spent to
+redirect, instead of every remaining request spent repeating. `MAX_STUCK_NUDGES = 2`, and
+these do not consume the gate-nudge budget.
+
+### 3. Microagent skills (`skills.ts`)
+
+OpenHands attaches markdown microagents when a task matches. Ours are written against
+this sandbox, not theirs, because advice about Docker or Python would be worse than
+none: `three` (setAnimationLoop, resize, no remote textures — CORS), `vite`
+(`vite --host 0.0.0.0`, write the scaffold by hand in one batch), `node` (bind `0.0.0.0`,
+ESM/CJS mismatch), `test`, `fix`. Triggered by the task text, at most two, and the
+activity log prints `playbook: …` so the prompt is never a mystery.
+
+### 4. Conversation condensation (`condense.ts`)
+
+Their condenser has several strategies and its own settings page; the mechanism is
+head + digest + tail. Ours is deterministic and spends **no** request — a model call to
+summarise would defeat the point on a small budget. Turns under 700 chars are kept
+verbatim (that is where decisions live: "switched to ESM", "port 5173"); longer ones
+collapse to their first line with a size note; the digest is capped at 4 000 chars and
+the whole history at 6 000 before anything is dropped. Replaces the old `history.slice(-8)`,
+which discarded decisions and kept noise.
+
+### Not ported, and why
+
+- **Runtime container / Docker sandbox** — the opposite of in-tab WebContainers, which is
+  this app's whole premise.
+- **Agent Server, automation server, ACP agents** — server-side services; there is no
+  backend here by design.
+- **LLM security analyzer** (`LLMSecurityAnalyzer`) — a second model call per risky action,
+  billed to the same key. The static classifier covers the same failures for free.
+- **`confirm_unknown: true`** — their backends can add tools at runtime; this one cannot,
+  so an unknown tool is inert and not worth a prompt.

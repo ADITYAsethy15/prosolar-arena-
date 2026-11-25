@@ -96,6 +96,13 @@ map and the reasoning behind each piece.
   400k-cell cap, so a 4000-line file cannot stall the tab.
 - **The conversation survives a reload.** The transcript is saved to IndexedDB alongside the project, so a
   refreshed tab shows the last thread next to the files, not an empty log in front of a finished project.
+- **Ported from OpenHands:** a `never / risky / always` confirmation policy with real risk
+  classification (destructive commands, secrets, the lockfile) instead of one auto-approve
+  checkbox; stuck detection (repeated identical calls, repeated failures, and read-only
+  calls with no write) that redirects the model instead of letting it burn the budget;
+  task-triggered playbooks (three.js, Vite, Node, tests, debugging) written for this
+  sandbox; and deterministic conversation condensation that keeps decisions when a long
+  thread has to be shortened.
 - **`stop` means stop.** It interrupts the model request, kills the running command (before this it ran to its
   own timeout — up to 300 s for an install — which is why `stop` looked dead), and answers an open approval
   prompt as a rejection. Closing the panel stops the turn as well.

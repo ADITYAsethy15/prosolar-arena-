@@ -24,10 +24,17 @@ import { allToolDefsForProvider } from './projectTools';
 import { projectStore } from './project';
 import { drainPreviewIssues, listPreviews } from './container';
 import { clampBatch, clampRounds } from './mode';
+import { needsConfirmation, toolRisk, type ConfirmationPolicy, type Risk } from './policy';
+import { detectStuck } from './stuck';
+import { skillsFor, skillBlock } from './skills';
+import { condense } from './condense';
 
 export const MAX_AGENT_STEPS = 32;
 /** How many times the gate may hand the model a "NEXT REQUIRED ACTION" it ignored. */
 export const MAX_GATE_NUDGES = 2;
+
+/** How many times the stuck detector may intervene in one task before it gives up. */
+export const MAX_STUCK_NUDGES = 2;
 
 /**
  * Added to the prompt in single-shot mode. It rewrites the tool order the rest of the
@@ -506,6 +513,8 @@ export type RunOptions = {
   parallelToolCalls?: boolean;
   signal?: AbortSignal;
   emit: (event: AgentEvent) => void;
+  /** never | risky | always — see policy.ts. */
+  confirmationPolicy?: ConfirmationPolicy;
   /** Stream the model's reasoning trace into the activity log (off by default: it is noise for most users). */
   showThinking?: boolean;
   onStats?: (stats: {
@@ -534,9 +543,21 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
   const messages: Array<Record<string, unknown>> = [
     {
       role: 'system',
-      content: `${SYSTEM_PROMPT}\n\n${options.singleShot ? `${SINGLE_SHOT_BRIEF}\n\n` : ''}${inventory}`,
+      content: [
+        SYSTEM_PROMPT,
+        options.singleShot ? SINGLE_SHOT_BRIEF : '',
+        skillBlock(options.prompt),
+        inventory,
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
     },
-    ...options.history.slice(-8).map((turn) => ({ role: turn.role, content: turn.content })),
+    // Condensed rather than truncated: `slice(-8)` threw away the decisions and kept the
+    // noise, and every round re-sent whatever survived. See condense.ts.
+    ...condense(options.history.slice(-40), { headCount: 1, tailCount: 6, maxChars: 6_000 }).map((turn) => ({
+      role: turn.role,
+      content: turn.content,
+    })),
     { role: 'user', content: options.prompt },
   ];
 
@@ -562,6 +583,10 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
   const batchSize = clampBatch(options.maxToolCallsPerRound);
   /** Did any turn actually report usage? If not the counter understates, and says so. */
   let usageReported = false;
+  /** Read-only calls since the last write/run, for the "inspection instead of work" guard. */
+  let consecutiveReads = 0;
+  /** How many times stuck detection has already intervened; it must not nag forever. */
+  let stuckNudges = 0;
   const emitUsage = () =>
     options.emit({
       kind: 'usage',
@@ -575,6 +600,10 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
       reported: usageReported,
     });
 
+  const skills = skillsFor(options.prompt);
+  if (skills.length > 0) {
+    options.emit({ kind: 'log', text: `playbook: ${skills.map((skill) => skill.title).join(', ')}` });
+  }
   options.emit({
     kind: 'log',
     text:
@@ -774,6 +803,7 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
       } catch (error) {
         const note = String((error as Error)?.message ?? error);
         options.emit({ kind: 'tool', round, tool: name, detail: note, output: note, ok: false });
+        calls.push({ id: call.id, name, args: {}, failed: true, position: calls.length + 1 });
         messages.push({ role: 'tool', tool_call_id: call.id, content: note });
         continue;
       }
@@ -781,6 +811,8 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
       const record: CallRecord = { id: call.id, name, args, failed: false, position: calls.length + 1 };
       calls.push(record);
       toolCallsRun += 1;
+      const readOnly = /^project_(read_file|list_paths|search_content|find_related_files|get_process_output)$/.test(name);
+      consecutiveReads = readOnly ? consecutiveReads + 1 : 0;
 
       const before = snapshotBefore(name, args);
       const outcome = await runOneTool(name, args, options, calls);
@@ -802,6 +834,26 @@ export async function runAgentTask(options: RunOptions): Promise<string> {
         ok: !outcome.result.isError,
       });
       messages.push({ role: 'tool', tool_call_id: call.id, content: outcome.text.slice(0, 60_000) });
+    }
+
+    // Stuck detection (ported from OpenHands). Checked right after the calls run, so the
+    // correction reaches the model in the NEXT request — one request, not a dead budget.
+    const verdict =
+      stuckNudges < MAX_STUCK_NUDGES
+        ? detectStuck(
+            calls.map((entry) => ({ name: entry.name, args: entry.args, failed: entry.failed })),
+            consecutiveReads,
+          )
+        : null;
+    if (verdict) {
+      stuckNudges += 1;
+      options.emit({ kind: 'log', text: `stuck: ${verdict.note} — redirecting the model` });
+      messages.push({ role: 'user', content: verdict.message });
+      // A repeated call means the model is not converging; the corrective message is worth
+      // one request on its own, so it does not consume the gate-nudge budget.
+      if (round < rounds) {
+        continue;
+      }
     }
 
     const progress = getProgress(calls, options.prompt, toolRounds, denied);
@@ -965,8 +1017,13 @@ async function runOneTool(
             ? `delete: ${String(args.path ?? '')}`
             : `${name}: ${String(args.path ?? args.query ?? '')}`;
 
-  if (requiresApproval(name) && approvalSink) {
-    const ok = await approvalSink({ tool: name, detail, signal: options.signal });
+  // OpenHands' policy split: `never` runs everything, `always` asks about everything,
+  // `risky` asks only about actions that can destroy work or leave the project. The risk
+  // classification lives in policy.ts so it can be unit tested without a model.
+  const risk = toolRisk(name, args);
+  const policy = options.confirmationPolicy ?? 'risky';
+  if (approvalSink && needsConfirmation(policy, risk)) {
+    const ok = await approvalSink({ tool: name, detail, risk, signal: options.signal });
     if (!ok) {
       const text = 'The user rejected this action. Do not retry it unchanged; pick another approach or explain why it is required.';
       return {
@@ -1135,17 +1192,7 @@ export function lineDiff(
   return collapsed;
 }
 
-function requiresApproval(name: string): boolean {
-  return (
-    name === 'project_write_file' ||
-    name === 'project_replace_lines' ||
-    name === 'project_patch_file' ||
-    name === 'project_delete_path' ||
-    name === 'project_run_command'
-  );
-}
-
-export type ApprovalRequest = { tool: string; detail: string; signal?: AbortSignal };
+export type ApprovalRequest = { tool: string; detail: string; risk: Risk; signal?: AbortSignal };
 export type ApprovalSink = (request: ApprovalRequest) => Promise<boolean>;
 
 let approvalSink: ApprovalSink | null = null;
